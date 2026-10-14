@@ -1,1 +1,28 @@
-# TODO: define base system prompt, safety boundaries, and context assembly.
+"""系统提示词。
+
+P0 只有通用聊天一个分支。P1 的创作模式（写作/润色/总结/翻译/头脑风暴/学习
+辅导）会在这里按 mode 分发到不同模板，届时 creation_modes.py 才派上用场。
+"""
+
+from __future__ import annotations
+
+BASE_SYSTEM_PROMPT = (
+    "你是一个中文 AI 助手，回答准确、简洁、有条理。"
+    "不确定的事情要直接说不知道，不要编造事实、数据或引用。"
+    "涉及代码时给出可直接运行的最小示例，并说明前提条件。"
+)
+
+# 会话标题生成：要求短、不带标点、不解释。
+TITLE_SYSTEM_PROMPT = (
+    "你负责给对话起标题。只输出标题本身，不要引号、不要标点、不要任何解释，"
+    "长度不超过 20 个汉字。"
+)
+
+
+def get_system_prompt(mode: str = "chat") -> str:
+    """按创作模式返回系统提示词。
+
+    P0 所有模式都返回同一份基础提示词——mode 字段会被校验但暂不改变行为，
+    前端也还没有暴露模式选择器，所以用户看不到这个落差。
+    """
+    return BASE_SYSTEM_PROMPT

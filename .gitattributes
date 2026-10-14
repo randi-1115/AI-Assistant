@@ -1,0 +1,22 @@
+# 统一行尾：仓库里一律存 LF，检出时由各平台自行决定。
+# 不加这个文件的话，每次 git add 都会为每个文件刷一行 CRLF 转换警告。
+* text=auto
+
+# 明确按文本处理
+*.py   text
+*.ts   text
+*.vue  text
+*.md   text
+*.css  text
+*.json text
+*.ini  text
+
+# 二进制，不要碰
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.docx binary
+
+# Windows 批处理需要 CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf

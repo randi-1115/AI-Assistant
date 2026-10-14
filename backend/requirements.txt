@@ -3,7 +3,14 @@ fastapi
 uvicorn[standard]
 pydantic-settings
 sqlalchemy[asyncio]
-asyncmy
+# MySQL 异步驱动。选择 aiomysql（纯 Python）而非 asyncmy，因为它在 Windows 上
+# 无需编译即可安装，asyncmy 的预编译 wheel 覆盖不稳定。
+aiomysql
+# MySQL 8 默认使用 caching_sha2_password 认证，aiomysql/PyMySQL 走该认证路径
+# 时需要 cryptography，否则连接会直接报错。
+cryptography
+# SQLAlchemy 的异步模式依赖 greenlet。
+greenlet
 alembic
 httpx
 python-multipart
