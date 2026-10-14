@@ -1,0 +1,16 @@
+# Core backend dependencies; pin versions after testing in your environment.
+fastapi
+uvicorn[standard]
+pydantic-settings
+sqlalchemy[asyncio]
+asyncmy
+alembic
+httpx
+python-multipart
+pypdf
+python-docx
+Pillow
+
+# Development/test dependencies
+pytest
+pytest-asyncio
