@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -93,15 +92,27 @@ class CapabilityNotSupported(LLMError):
     message = "当前模型不支持该能力"
 
 
-def build_error_body(code: str, message: str) -> dict[str, Any]:
-    return {"error": {"code": code, "message": message, "request_id": get_request_id()}}
+def error_response(status_code: int, code: str, message: str) -> JSONResponse:
+    """统一的错误响应。
+
+    响应头里也要带 X-Request-ID：未处理的异常由 Starlette 的
+    ServerErrorMiddleware 处理，它在本项目的请求中间件**外层**，直接发响应，
+    会绕过中间件设置响应头的那一步。在 handler 里补上，保证任何错误响应
+    都能用同一个 id 去后端日志里定位。
+    """
+    request_id = get_request_id()
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message, "request_id": request_id}},
+        headers={"X-Request-ID": request_id},
+    )
 
 
 async def app_error_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
     # 可预期错误用 warning；500 级别的内部错误交给兜底 handler。
     logger.warning("业务错误 code=%s message=%s", exc.code, exc.message)
-    return JSONResponse(status_code=exc.status_code, content=build_error_body(exc.code, exc.message))
+    return error_response(exc.status_code, exc.code, exc.message)
 
 
 def _summarize_validation_error(exc: RequestValidationError) -> str:
@@ -116,25 +127,19 @@ def _summarize_validation_error(exc: RequestValidationError) -> str:
 
 async def validation_error_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
-    return JSONResponse(
-        status_code=422,
-        content=build_error_body("validation_error", _summarize_validation_error(exc)),
-    )
+    return error_response(422, "validation_error", _summarize_validation_error(exc))
 
 
 async def http_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     """让框架自己抛的 HTTPException（404 路由、405 方法不允许等）也走统一信封。"""
     assert isinstance(exc, StarletteHTTPException)
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=build_error_body(f"http_{exc.status_code}", str(exc.detail)),
-    )
+    return error_response(exc.status_code, f"http_{exc.status_code}", str(exc.detail))
 
 
 async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     # 堆栈只进日志，不进响应体。
     logger.exception("未处理异常：%s", exc)
-    return JSONResponse(status_code=500, content=build_error_body("internal_error", "服务器内部错误"))
+    return error_response(500, "internal_error", "服务器内部错误")
 
 
 def register_exception_handlers(app: FastAPI) -> None:

@@ -102,3 +102,15 @@ def test_unhandled_exception_hides_internals(client: TestClient):
     assert SECRET not in response.text
     assert "RuntimeError" not in response.text
     assert "Traceback" not in response.text
+
+
+def test_request_id_header_matches_body_on_every_error_path(client: TestClient):
+    """500 由 ServerErrorMiddleware 直接发响应，绕过了请求中间件设响应头那一步，
+    所以 handler 必须自己补上 X-Request-ID，否则前端拿不到能对上日志的 id。
+    """
+    for path in ("/not-found", "/rate-limited", "/needs-param", "/crash"):
+        response = client.get(path)
+        body = response.json()
+        assert body["error"]["request_id"]
+        # 这个测试应用没有装请求中间件，所以只断言「头存在且与 body 一致」
+        assert response.headers.get("X-Request-ID") == body["error"]["request_id"]
