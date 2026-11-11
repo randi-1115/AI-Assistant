@@ -42,6 +42,14 @@ NOW_MS = text("CURRENT_TIMESTAMP(3)")
 class TimestampMixin:
     """created_at / updated_at 由数据库生成，避免应用与库时钟不一致。"""
 
+    # eager_defaults：这两列的值由数据库生成，flush() 之后 SQLAlchemy 并不知道
+    # 它们是什么，属性会停在 expired 状态。异步会话里再去读就会触发一次同步 IO，
+    # 抛 MissingGreenlet（典型现场是 Pydantic 序列化时读 created_at）。
+    # 打开后 SQLAlchemy 会在 INSERT/UPDATE 之后立刻把这几个服务端生成的列取回来，
+    # 序列化就不必再查库。注意必须放在 mixin 上，各模型自己声明 __mapper_args__
+    # 会覆盖掉这里的设置。
+    __mapper_args__ = {"eager_defaults": True}
+
     created_at: Mapped[datetime] = mapped_column(
         DATETIME_MS, server_default=NOW_MS, nullable=False
     )

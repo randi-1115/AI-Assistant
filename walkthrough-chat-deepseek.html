@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="color-scheme: dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Chat 对话如何调用 DeepSeek</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: { colors: {
+      wt: {
+        bg: '#000000', surface: '#0a0a0a', raised: '#141414',
+        border: '#2a2a2a', fg: '#ffffff', muted: '#a0a0a0',
+        accent: '#a855f7', file: '#c084fc', red: '#ef4444',
+      },
+      node: {
+        component: '#a855f7', composable: '#7c3aed', utility: '#6d28d9',
+        external: '#525252', event: '#d8b4fe', data: '#9333ea',
+      },
+    }}},
+  };
+</script>
+<style>
+  html, body { margin: 0; background: #000; }
+  .mermaid-wrap svg { max-width: none !important; height: auto !important; }
+  .mermaid-wrap .node { cursor: pointer; }
+  .mermaid-wrap .node:hover rect,
+  .mermaid-wrap .node:hover polygon,
+  .mermaid-wrap .node:hover circle,
+  .mermaid-wrap .node:hover .label-container { filter: brightness(1.3); transition: filter .15s; }
+
+  .dt-body p { color:#a0a0a0; font-size:.88rem; line-height:1.65; margin-bottom:10px; }
+  .dt-body p code {
+    background:rgba(168,85,247,.12); padding:1px 6px; border-radius:4px;
+    font-family:'SF Mono','Fira Code',monospace; font-size:.82rem; color:#c084fc;
+  }
+  .dt-body .shiki, .dt-body pre.code-fallback {
+    background: #000000; border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; margin: 8px 0 14px;
+  }
+  .dt-body .shiki { background: #000000 !important; }
+  .dt-body .shiki code, .dt-body pre.code-fallback code {
+    font-family: 'SF Mono','Fira Code',monospace; font-size: .78rem; line-height: 1.55;
+    background: none; padding: 0; border-radius: 0;
+  }
+  .dt-body .shiki code { color: inherit; }
+  .dt-body pre.code-fallback code { color: #e0e0e0; }
+  kbd {
+    border: 1px solid #2a2a2a; border-radius: 4px; padding: 1px 5px;
+    background: #141414; font-family: 'SF Mono','Fira Code',monospace; font-size: .68rem;
+  }
+</style>
+</head>
+<body class="bg-wt-bg text-wt-fg">
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+
+<script type="module">
+import { createHighlighter } from 'https://cdn.jsdelivr.net/npm/shiki@3.22.0/+esm';
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+const SUMMARY = "一次对话是一条双向流：前端用 fetch（EventSource 不支持 POST）打开 SSE 连接；后端先把 user 消息和空的 assistant 占位行落库，再用 system prompt + 最近历史向 DeepSeek 的 /chat/completions 发起流式请求。token 逐条经 SSE 回传、前端原地追加渲染，流结束后后端回填同一条 assistant 记录。当前 P0 只有文本流式对话——没有重试、工具调用和记忆提取。";
+
+const DIAGRAM = `graph LR
+  subgraph browser["Browser · Vue 3"]
+    direction TB
+    chatInput["Chat Input Composer"]
+    chatView["Chat View · Send Handler"]
+    chatStore["Chat Store · Streaming State"]
+    sseClient["SSE Fetch Client & Parser"]
+  end
+  subgraph backend["FastAPI Backend"]
+    direction TB
+    chatEndpoint["Chat Streaming Endpoint"]
+    turnOrchestrator["Chat Turn Orchestrator"]
+    contextBuilder["Context Window Builder"]
+    messageLedger["Message Persistence Ledger"]
+  end
+  subgraph deepseek["DeepSeek Cloud"]
+    direction TB
+    providerRegistry["Provider Registry & Config"]
+    deepseekAdapter["DeepSeek HTTP Adapter"]
+    deepseekApi["/chat/completions API"]
+  end
+
+  chatInput -->|"emits send"| chatView
+  chatView -->|"sendMessage()"| chatStore
+  chatStore -->|"opens POST stream"| sseClient
+  sseClient -->|"HTTP POST"| chatEndpoint
+  chatEndpoint -->|"prepare_send / run_turn"| turnOrchestrator
+  chatEndpoint -->|"injects provider"| providerRegistry
+  turnOrchestrator -->|"builds context"| contextBuilder
+  turnOrchestrator -->|"persists messages"| messageLedger
+  turnOrchestrator -->|"stream_chat()"| deepseekAdapter
+  providerRegistry -->|"constructs"| deepseekAdapter
+  deepseekAdapter -->|"POST request"| deepseekApi
+  deepseekApi -.->|"data: lines"| deepseekAdapter
+  deepseekAdapter -.->|"token / usage / done"| turnOrchestrator
+  chatEndpoint -.->|"event: token / message_end"| sseClient
+  sseClient -.->|"typed callbacks"| chatStore
+  chatStore -.->|"rendered messages"| chatView
+
+  classDef component fill:#a855f7,stroke:#c084fc,color:#fff
+  classDef composable fill:#7c3aed,stroke:#a78bfa,color:#fff
+  classDef utility fill:#6d28d9,stroke:#8b5cf6,color:#fff
+  classDef external fill:#525252,stroke:#737373,color:#fff
+  classDef event fill:#d8b4fe,stroke:#e9d5ff,color:#000
+  classDef data fill:#9333ea,stroke:#a855f7,color:#fff
+
+  class chatInput event
+  class chatView component
+  class chatStore data
+  class sseClient utility
+  class chatEndpoint component
+  class turnOrchestrator composable
+  class contextBuilder utility
+  class messageLedger data
+  class providerRegistry component
+  class deepseekAdapter external
+  class deepseekApi external
+
+  click chatInput nodeClickHandler "View details"
+  click chatView nodeClickHandler "View details"
+  click chatStore nodeClickHandler "View details"
+  click sseClient nodeClickHandler "View details"
+  click chatEndpoint nodeClickHandler "View details"
+  click turnOrchestrator nodeClickHandler "View details"
+  click contextBuilder nodeClickHandler "View details"
+  click messageLedger nodeClickHandler "View details"
+  click providerRegistry nodeClickHandler "View details"
+  click deepseekAdapter nodeClickHandler "View details"
+  click deepseekApi nodeClickHandler "View details"
+`;
+
+const NODES = {
+  chatInput: {
+    title: "Chat Input Composer",
+    description: "用户输入的起点。回车或点发送后，去掉首尾空白，通过 send 事件交给页面；流式生成期间发送键会变成“停止”。",
+    files: ["frontend/src/components/chat/ChatInput.vue:10-27"],
+    code: `const content = text.value.trim()
+if (!content || props.disabled) return
+text.value = ''
+emit('send', content)`,
+    lang: "vue",
+  },
+  chatView: {
+    title: "Chat View · Send Handler",
+    description: "页面级编排：没有当前会话就先创建，再把发送动作委托给 chat store；停止按钮直接调用 chat.stop() 中止 fetch。消息列表也在这里渲染。",
+    files: ["frontend/src/views/ChatView.vue:35-44,67"],
+    code: `await chat.sendMessage(conversationId, content)
+
+<ChatInput :disabled="streaming" :streaming="streaming" @send="handleSend" @stop="chat.stop()" />`,
+    lang: "vue",
+  },
+  chatStore: {
+    title: "Chat Store · Streaming State",
+    description: "前端唯一的状态真相。先乐观插入 user 消息和负数 id 的 assistant 占位，收到什么 token 就原地追加；message_start 时替换成后端真实 id，message_end 时定稿状态。",
+    files: ["frontend/src/stores/chat.ts:84-164"],
+    code: `onToken: ({ text }) => {
+  assistantMessage.content += text
+}`,
+    lang: "typescript",
+  },
+  sseClient: {
+    title: "SSE Fetch Client & Parser",
+    description: "EventSource 不能发 POST，所以这里用 fetch + ReadableStream 手工消费 SSE。SSEParser 负责跨 TCP 分块缓冲，按空行切帧并解析 event / data。",
+    files: ["frontend/src/api/chat.ts:26-98", "frontend/src/api/sse.ts:15-84"],
+    code: `const response = await fetch(apiUrl(path), {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+  body: body === null ? undefined : JSON.stringify(body),
+  signal,
+})`,
+    lang: "typescript",
+  },
+  chatEndpoint: {
+    title: "Chat Streaming Endpoint",
+    description: "POST /api/v1/conversations/{id}/messages/stream。它在响应头发出前完成 prepare_send（校验归属、落库消息），然后返回 SSE StreamingResponse，并顺手把首轮标题生成丢给后台任务。",
+    files: ["backend/app/api/v1/endpoints/chat.py:41-64", "backend/app/api/v1/sse.py:17-30"],
+    code: `@router.post("/{conversation_id}/messages/stream")
+async def stream_message(
+    conversation_id: int,
+    payload: ChatStreamRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,`,
+    lang: "python",
+  },
+  turnOrchestrator: {
+    title: "Chat Turn Orchestrator",
+    description: "ChatService 是整轮对话的唯一负责人：prepare_* 负责流开始前的落库与上下文组装，run_turn 负责流中的 token/usage/done 转发、断连检测，以及用独立 session 回填 assistant 消息。",
+    files: ["backend/app/services/chat_service.py:110-320"],
+    code: `async for event in self.provider.stream_chat(
+    prepared.provider_messages, self._options_factory()
+):`,
+    lang: "python",
+  },
+  contextBuilder: {
+    title: "Context Window Builder",
+    description: "纯函数、不碰数据库：把历史裁剪成 [system prompt] + 最近 N 条（默认 20 条 / 8000 字符），丢掉空内容并移除开头的非 user 孤儿消息；system prompt 目前固定为 BASE_SYSTEM_PROMPT。",
+    files: ["backend/app/services/context_builder.py:27-67", "backend/app/ai/prompts/system.py:22-28"],
+    code: `context = [ChatMessage(role=ROLE_SYSTEM, content=system_prompt)]
+context.extend(ChatMessage(role=m.role, content=m.content) for m in selected)`,
+    lang: "python",
+  },
+  messageLedger: {
+    title: "Message Persistence Ledger",
+    description: "流开始前先插入 user 消息（complete）和空的 assistant 占位行（streaming）；流结束后 UPDATE 同一条 assistant 记录，补上内容、状态、模型和用量，并用 asyncio.shield 保证中断时也能保存。",
+    files: ["backend/app/repositories/message_repo.py:49-94", "backend/app/services/chat_service.py:284-320"],
+    code: `update(Message)
+    .where(Message.id == message_id)
+    .values(`,
+    lang: "python",
+  },
+  providerRegistry: {
+    title: "Provider Registry & Config",
+    description: "按 LLM_PROVIDER 字符串（mock | deepseek）选择实现，用 lru_cache 缓存单例；启动时校验保证 deepseek 模式下 API key 与 model 不为空。默认 base URL 就是 https://api.deepseek.com。",
+    files: ["backend/app/ai/providers/registry.py:16-44", "backend/app/core/config.py:44-52,91-107"],
+    code: `if settings.llm_provider == "deepseek":
+    return OpenAICompatibleProvider(
+        name="deepseek",
+        base_url=settings.llm_base_url,`,
+    lang: "python",
+  },
+  deepseekAdapter: {
+    title: "DeepSeek HTTP Adapter",
+    description: "刻意手写 httpx（不用 openai SDK）的 OpenAI 兼容适配器：POST {base_url}/chat/completions，逐行解析上游 SSE，把 401/403、429、超时等映射成应用内 LLM 错误。P0 没有重试或退避。",
+    files: ["backend/app/ai/providers/openai_compat.py:78-220"],
+    code: `async with client.stream("POST", CHAT_COMPLETIONS_PATH, json=payload) as response:
+    if response.status_code >= 400:
+        body = await response.aread()
+        raise self._map_status_error(response.status_code, body)`,
+    lang: "python",
+  },
+  deepseekApi: {
+    title: "DeepSeek /chat/completions API",
+    description: "DeepSeek 的 OpenAI 兼容流式接口，以 data: {...} 行返回增量，最后以 [DONE] 结束。本地 .env 配置的模型是 deepseek-flash；OpenAI 式稍后单独下发 usage 的情况也被兼容处理。",
+    files: ["https://api.deepseek.com/chat/completions"],
+    code: `{
+  "model": "deepseek-flash",
+  "messages": [{"role": "system", "content": "..."}],
+  "max_tokens": 2048,
+  "temperature": 0.7,
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}`,
+    lang: "json",
+  },
+};
+
+const LEGEND = [
+  { label: "Component", color: "bg-node-component" },
+  { label: "Orchestrator", color: "bg-node-composable" },
+  { label: "Utility", color: "bg-node-utility" },
+  { label: "State / Data", color: "bg-node-data" },
+  { label: "Trigger", color: "bg-node-event" },
+  { label: "External", color: "bg-node-external" },
+];
+
+const langs = [...new Set(Object.values(NODES).map(n => n.lang).filter(Boolean))];
+if (langs.length === 0) langs.push("typescript");
+let highlighter = null;
+try { highlighter = await createHighlighter({ themes: ["vitesse-dark"], langs }); }
+catch (e) { console.warn("Shiki failed:", e); }
+const HIGHLIGHTED = {};
+for (const [id, node] of Object.entries(NODES)) {
+  if (node.code && highlighter) {
+    try {
+      HIGHLIGHTED[id] = highlighter.codeToHtml(node.code, { lang: node.lang || "typescript", theme: "vitesse-dark" });
+    } catch (e) { console.warn(`Highlight failed for ${id}:`, e); }
+  }
+}
+
+const MERMAID_THEME = {
+  primaryColor: '#0a0a0a', primaryTextColor: '#ffffff', primaryBorderColor: '#2a2a2a',
+  lineColor: '#a0a0a0', background: '#000000',
+};
+
+function usePanZoom() {
+  const viewportRef = useRef(null), canvasRef = useRef(null), zoomDisplayRef = useRef(null);
+  const st = useRef({ zoom: 1, panX: 0, panY: 0 });
+  const drag = useRef({ on: false, lx: 0, ly: 0 });
+
+  const apply = useCallback(() => {
+    const { zoom, panX, panY } = st.current;
+    if (canvasRef.current)
+      canvasRef.current.style.transform = `translate(${panX}px,${panY}px) scale(${zoom})`;
+    if (zoomDisplayRef.current)
+      zoomDisplayRef.current.textContent = Math.round(zoom * 100) + '%';
+  }, []);
+
+  const fitToScreen = useCallback(() => {
+    const svg = canvasRef.current?.querySelector('svg');
+    const vp = viewportRef.current;
+    if (!svg || !vp) return;
+    const s = st.current;
+    const vw = vp.clientWidth, vh = vp.clientHeight;
+    const sw = svg.getBoundingClientRect().width / s.zoom;
+    const sh = svg.getBoundingClientRect().height / s.zoom;
+    const fit = Math.max(0.15, Math.min(2, Math.min((vw - 80) / sw, (vh - 80) / sh)));
+    s.zoom = fit; s.panX = (vw - sw * fit) / 2; s.panY = (vh - sh * fit) / 2;
+    apply();
+  }, [apply]);
+
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const onWheel = (e) => {
+      e.preventDefault();
+      const r = vp.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top, s = st.current;
+      const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const nz = Math.min(4, Math.max(0.15, s.zoom * f)), sc = nz / s.zoom;
+      s.panX = mx - sc * (mx - s.panX); s.panY = my - sc * (my - s.panY); s.zoom = nz;
+      apply();
+    };
+    const onDown = (e) => {
+      if (e.target.closest('.node')) return;
+      drag.current = { on: true, lx: e.clientX, ly: e.clientY };
+      vp.setPointerCapture(e.pointerId);
+    };
+    const onMove = (e) => {
+      const d = drag.current; if (!d.on) return;
+      st.current.panX += e.clientX - d.lx; st.current.panY += e.clientY - d.ly;
+      d.lx = e.clientX; d.ly = e.clientY; apply();
+    };
+    const onUp = () => { drag.current.on = false; };
+    vp.addEventListener('wheel', onWheel, { passive: false });
+    vp.addEventListener('pointerdown', onDown);
+    vp.addEventListener('pointermove', onMove);
+    vp.addEventListener('pointerup', onUp);
+    vp.addEventListener('pointercancel', onUp);
+    window.addEventListener('resize', fitToScreen);
+    return () => {
+      vp.removeEventListener('wheel', onWheel);
+      vp.removeEventListener('pointerdown', onDown);
+      vp.removeEventListener('pointermove', onMove);
+      vp.removeEventListener('pointerup', onUp);
+      vp.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('resize', fitToScreen);
+    };
+  }, [apply, fitToScreen]);
+
+  const zoomIn = useCallback(() => { st.current.zoom = Math.min(4, st.current.zoom * 1.25); apply(); }, [apply]);
+  const zoomOut = useCallback(() => { st.current.zoom = Math.max(0.15, st.current.zoom / 1.25); apply(); }, [apply]);
+  return { viewportRef, canvasRef, zoomDisplayRef, zoomIn, zoomOut, fitToScreen };
+}
+
+function MermaidDiagram({ onNodeClick }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    window.nodeClickHandler = onNodeClick;
+    mermaid.initialize({
+      startOnLoad: false, theme: 'dark', securityLevel: 'loose',
+      themeVariables: {
+        ...MERMAID_THEME,
+        secondaryColor: '#000000', tertiaryColor: '#000000',
+        mainBkg: '#0a0a0a', nodeBorder: '#2a2a2a',
+        clusterBkg: 'rgba(10,10,10,0.8)', clusterBorder: '#7c3aed',
+        titleColor: '#ffffff', edgeLabelBackground: 'transparent',
+      },
+      flowchart: { useMaxWidth: false, htmlLabels: true, curve: 'basis' },
+    });
+    let cancelled = false;
+    mermaid.render('walkthrough-diagram', DIAGRAM).then(({ svg, bindFunctions }) => {
+      if (cancelled || !ref.current) return;
+      ref.current.innerHTML = svg;
+      bindFunctions?.(ref.current);
+    }).catch((e) => console.error('Mermaid render failed:', e));
+    return () => { cancelled = true; delete window.nodeClickHandler; };
+  }, [onNodeClick]);
+  return React.createElement('div', { ref, className: 'mermaid-wrap' });
+}
+
+function Summary({ collapsed, onToggle }) {
+  if (collapsed) {
+    return React.createElement('div', {
+      onClick: onToggle,
+      className: 'fixed top-16 left-6 z-10 px-3 py-1.5 bg-wt-surface/60 backdrop-blur border border-wt-border rounded-full shadow-lg cursor-pointer hover:bg-wt-surface/80 transition-all duration-300',
+    }, React.createElement('span', { className: 'text-xs text-wt-muted font-medium' }, 'ℹ︎ Summary'));
+  }
+  return React.createElement('div', {
+    onClick: onToggle,
+    className: 'fixed top-16 left-6 z-10 max-w-lg px-4 py-3 bg-wt-surface/80 backdrop-blur border border-wt-border rounded-lg shadow-lg cursor-pointer transition-all duration-300',
+  },
+    React.createElement('p', { className: 'text-sm text-wt-muted leading-relaxed' }, SUMMARY),
+    React.createElement('p', { className: 'text-[0.65rem] text-wt-muted/50 mt-1.5' }, 'Click to dismiss')
+  );
+}
+
+function DetailPanel({ nodeId, node, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const codeHtml = HIGHLIGHTED[nodeId];
+  return React.createElement('div', {
+    className: 'fixed top-4 right-4 bottom-4 w-[560px] max-w-[90vw] z-30 bg-wt-surface border border-wt-border rounded-xl shadow-2xl flex flex-col overflow-hidden',
+  },
+    React.createElement('button', {
+      onClick: onClose,
+      className: 'absolute top-3 right-3 z-10 w-7 h-7 rounded-md border border-wt-border bg-wt-raised text-wt-muted flex items-center justify-center text-lg hover:bg-wt-red hover:border-wt-red hover:text-white transition-colors',
+    }, '×'),
+    React.createElement('div', { className: 'flex-1 overflow-y-auto p-5' },
+      React.createElement('h2', { className: 'text-lg font-bold text-wt-fg mb-3 pr-9' }, node.title),
+      React.createElement('div', { className: 'dt-body' },
+        React.createElement('p', null, node.description)
+      ),
+      node.code ? React.createElement('div', { className: 'dt-body' },
+        codeHtml
+          ? React.createElement('div', { dangerouslySetInnerHTML: { __html: codeHtml } })
+          : React.createElement('pre', { className: 'code-fallback' }, React.createElement('code', null, node.code))
+      ) : null,
+      node.files && node.files.length > 0 ? React.createElement('div', { className: 'mt-4 pt-3 border-t border-wt-border' },
+        React.createElement('div', { className: 'text-[0.7rem] uppercase tracking-wider text-wt-muted font-semibold mb-1.5' }, 'Files'),
+        React.createElement('code', { className: 'text-sm text-wt-file font-mono leading-relaxed' },
+          node.files.map((f, i) => React.createElement('span', { key: i }, f, React.createElement('br')))
+        )
+      ) : null
+    )
+  );
+}
+
+function ZoomControls({ zoomDisplayRef, onZoomIn, onZoomOut, onFit }) {
+  const btn = (label, onClick, title) => React.createElement('button', {
+    onClick, title,
+    className: 'w-8 h-8 rounded-md border border-wt-border bg-wt-raised text-wt-muted hover:text-wt-fg hover:border-wt-accent transition-colors flex items-center justify-center text-sm',
+  }, label);
+  return React.createElement('div', {
+    className: 'fixed bottom-5 left-5 z-20 flex items-center gap-1.5 px-2 py-1.5 bg-wt-surface border border-wt-border rounded-lg shadow-xl',
+  },
+    btn('−', onZoomOut, 'Zoom out'),
+    React.createElement('span', { ref: zoomDisplayRef, className: 'text-xs text-wt-muted w-10 text-center tabular-nums' }, '100%'),
+    btn('+', onZoomIn, 'Zoom in'),
+    btn('⤢', onFit, 'Fit to screen')
+  );
+}
+
+function App() {
+  const [activeId, _setActiveId] = useState(null);
+  const [summaryCollapsed, setSummaryCollapsed] = useState(true);
+  const pz = usePanZoom();
+
+  const setActiveNode = useCallback((nodeId) => {
+    const id = typeof nodeId === 'string' ? nodeId : (nodeId && nodeId.id) || null;
+    _setActiveId(id);
+    document.querySelectorAll('.mermaid-wrap .node').forEach(n => { n.style.opacity = id ? '0.4' : '1'; });
+    if (id) {
+      const el = document.querySelector(`.mermaid-wrap .node[id*="${id}"]`);
+      if (el) el.style.opacity = '1';
+    }
+  }, []);
+
+  const closeDetail = useCallback(() => {
+    _setActiveId(null);
+    document.querySelectorAll('.mermaid-wrap .node').forEach(n => { n.style.opacity = '1'; });
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(pz.fitToScreen, 600);
+    return () => clearTimeout(t);
+  }, [pz.fitToScreen]);
+
+  return React.createElement(React.Fragment, null,
+    React.createElement('header', {
+      className: 'fixed top-0 inset-x-0 z-10 px-6 py-3.5 bg-gradient-to-b from-wt-bg to-transparent pointer-events-none',
+    },
+      React.createElement('h1', { className: 'text-base font-semibold text-wt-fg' }, 'Chat 对话如何调用 DeepSeek'),
+      React.createElement('p', { className: 'text-sm text-wt-muted mt-0.5' }, 'ai-assistant-v1 · 从输入框到 /chat/completions 的完整流式链路')
+    ),
+    React.createElement(Summary, { collapsed: summaryCollapsed, onToggle: () => setSummaryCollapsed(c => !c) }),
+    React.createElement('div', {
+      ref: pz.viewportRef,
+      className: 'w-full h-screen overflow-hidden cursor-grab active:cursor-grabbing',
+    },
+      React.createElement('div', {
+        ref: pz.canvasRef,
+        className: 'origin-top-left will-change-transform inline-block p-[80px_60px_60px]',
+      }, React.createElement(MermaidDiagram, { onNodeClick: setActiveNode }))
+    ),
+    React.createElement(ZoomControls, {
+      zoomDisplayRef: pz.zoomDisplayRef, onZoomIn: pz.zoomIn, onZoomOut: pz.zoomOut, onFit: pz.fitToScreen,
+    }),
+    React.createElement('div', {
+      className: 'fixed bottom-5 left-1/2 -translate-x-1/2 z-20 flex flex-wrap justify-center gap-4 px-4 py-2 bg-wt-surface border border-wt-border rounded-lg shadow-xl',
+    },
+      LEGEND.map(l => React.createElement('span', { key: l.label, className: 'flex items-center gap-1.5 text-xs text-wt-muted' },
+        React.createElement('span', { className: `w-2 h-2 rounded-full ${l.color}` }),
+        l.label
+      ))
+    ),
+    activeId && NODES[activeId]
+      ? React.createElement(DetailPanel, { nodeId: activeId, node: NODES[activeId], onClose: closeDetail })
+      : null,
+    React.createElement('div', { className: 'fixed bottom-5 right-5 z-20 text-xs text-wt-muted opacity-50' },
+      React.createElement('kbd', null, 'Scroll'), ' zoom · ',
+      React.createElement('kbd', null, 'Drag'), ' pan · Click nodes'
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
