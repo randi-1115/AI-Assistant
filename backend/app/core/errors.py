@@ -57,6 +57,46 @@ class ValidationAppError(AppError):
     message = "请求参数不合法"
 
 
+# --- 文件上传 ---
+class FileNotFound(NotFoundError):
+    code = "file_not_found"
+    message = "文件不存在"
+
+
+class FileTooLarge(AppError):
+    code = "file_too_large"
+    status_code = 413
+    message = "文件超过大小限制"
+
+
+class UnsupportedFileType(AppError):
+    code = "unsupported_file_type"
+    status_code = 415
+    message = "不支持的文件类型"
+
+
+class InvalidFileContent(AppError):
+    code = "invalid_file_content"
+    status_code = 415
+    message = "文件内容与扩展名不符"
+
+
+class InvalidFileName(ValidationAppError):
+    code = "invalid_file_name"
+    message = "文件名不合法"
+
+
+class TooManyAttachments(ValidationAppError):
+    code = "too_many_attachments"
+    message = "单条消息最多附带 10 个文件"
+
+
+class StorageFailure(AppError):
+    code = "storage_error"
+    status_code = 500
+    message = "文件存储失败"
+
+
 # --- LLM ---
 class LLMError(AppError):
     code = "llm_error"

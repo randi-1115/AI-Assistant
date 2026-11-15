@@ -18,23 +18,35 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.prompts.system import TITLE_SYSTEM_PROMPT, get_system_prompt
 from app.ai.providers.base import ChatMessage, ChatOptions, ChatUsage, LLMProvider, ROLE_USER
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.errors import (
     AppError,
     ConversationNotFound,
+    FileNotFound,
     LLMError,
+    TooManyAttachments,
     ValidationAppError,
 )
 from app.core.logging import get_request_id
 from app.db.session import SessionLocal
+from app.models.attachment import PARSE_READY, Attachment
 from app.models.conversation import DEFAULT_CONVERSATION_TITLE
+from app.rag.pipeline import (
+    build_excerpts,
+    build_rag_block,
+    build_source_payloads,
+    validate_citations,
+)
+from app.rag.retriever import KeywordRetriever, query_terms
+from app.repositories.attachment_repo import AttachmentRepository
 from app.repositories.conversation_repo import ConversationRepository
 from app.repositories.message_repo import (
     ROLE_ASSISTANT,
@@ -46,7 +58,16 @@ from app.repositories.message_repo import (
     MessageRepository,
 )
 from app.schemas.chat import dump_usage
+from app.search.pipeline import (
+    build_web_block,
+    build_web_empty_block,
+    build_web_source_payloads,
+    build_web_unavailable_block,
+    merge_web_context,
+)
+from app.search.service import SearchOutcome, SearchService
 from app.services.context_builder import build_context
+from app.services.file_service import attachment_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +75,9 @@ logger = logging.getLogger(__name__)
 MAX_TITLE_CHARS = 20
 # 取历史时最多捞多少条，超过上下文预算的部分由 build_context 裁掉。
 HISTORY_FETCH_LIMIT = 200
+
+
+MAX_ATTACHMENT_IDS = 10
 
 
 @dataclass(slots=True)
@@ -66,6 +90,11 @@ class PreparedTurn:
     is_first_turn: bool
     first_user_content: str
     title_is_default: bool
+    # 本轮检索到的文件来源，流开始后逐条通过 SSE 发给前端。
+    sources: list[dict[str, Any]] = field(default_factory=list)
+    # 重新生成时从用户消息继承的搜索设置与原始问题。
+    query: str = ""
+    search_mode: str = "off"
 
 
 def fallback_title(content: str) -> str:
@@ -91,10 +120,12 @@ class ChatService:
         provider: LLMProvider,
         session_factory: async_sessionmaker[AsyncSession] = SessionLocal,
         options_factory: Callable[[], ChatOptions] | None = None,
+        search_service: SearchService | None = None,
     ) -> None:
         self.provider = provider
         self.session_factory = session_factory
         self._options_factory = options_factory or self._default_options
+        self.search_service = search_service or SearchService(get_settings())
 
     @staticmethod
     def _default_options() -> ChatOptions:
@@ -107,15 +138,120 @@ class ChatService:
 
     # --- 准备阶段（错误在这里抛出，前端收到的是普通 JSON 错误）---
 
+    async def _prepare_rag(
+        self,
+        *,
+        session: AsyncSession,
+        settings: Settings,
+        user_id: int,
+        conversation_id: int,
+        query: str,
+        attachment_ids: list[int] | None,
+        strict: bool,
+    ) -> tuple[list[Attachment], list[dict[str, Any]], str | None]:
+        """校验附件、检索片段、组装提示词块。
+
+        strict=True（新消息）：不存在/别人的/跨会话的附件直接 404。
+        strict=False（重新生成）：跳过已删除或已解绑的附件，不让历史附件
+        阻止重新生成。
+        """
+        deduped: list[int] = []
+        seen: set[int] = set()
+        for file_id in attachment_ids or []:
+            if file_id in seen:
+                continue
+            seen.add(file_id)
+            deduped.append(file_id)
+        if strict and len(deduped) > MAX_ATTACHMENT_IDS:
+            raise TooManyAttachments()
+        deduped = deduped[:MAX_ATTACHMENT_IDS]
+        if not deduped:
+            return [], [], None
+
+        repo = AttachmentRepository(session)
+        attachments = await repo.list_owned_by_ids(user_id, deduped)
+        by_id = {attachment.id: attachment for attachment in attachments}
+
+        if strict:
+            missing = [file_id for file_id in deduped if file_id not in by_id]
+            if missing:
+                raise FileNotFound()
+
+        scoped: list[Attachment] = []
+        for file_id in deduped:
+            attachment = by_id.get(file_id)
+            if attachment is None:
+                continue
+            if attachment.conversation_id in (None, conversation_id):
+                scoped.append(attachment)
+            elif strict:
+                # 阶段 2 不支持跨会话复用附件；对当前会话来说等同于不存在。
+                raise FileNotFound()
+        if not scoped:
+            return [], [], None
+
+        # 首次使用时绑定到当前会话，删除会话才能级联清理这些文件。
+        unclaimed = [attachment.id for attachment in scoped if attachment.conversation_id is None]
+        if unclaimed:
+            await repo.claim_conversation(user_id, unclaimed, conversation_id)
+            for attachment in scoped:
+                if attachment.id in unclaimed:
+                    attachment.conversation_id = conversation_id
+
+        ready_ids = [
+            attachment.id for attachment in scoped if attachment.parse_status == PARSE_READY
+        ]
+        retrieved = []
+        if ready_ids:
+            retrieved = await KeywordRetriever(session, settings).retrieve(
+                user_id=user_id,
+                query=query,
+                attachment_ids=ready_ids,
+            )
+
+        terms = query_terms(query)
+        excerpts = build_excerpts(
+            retrieved,
+            terms=terms,
+            max_chars=settings.rag_context_max_chars,
+            per_file_max_excerpts=settings.rag_max_excerpts_per_file,
+        )
+        snapshots = [attachment_snapshot(attachment) for attachment in scoped]
+        rag_block = build_rag_block(excerpts, attachments=snapshots)
+        sources = build_source_payloads(
+            excerpts,
+            terms=terms,
+            snippet_chars=settings.rag_source_snippet_chars,
+        )
+        return scoped, sources, rag_block
+
     async def prepare_send(
-        self, *, conversation_id: int, user_id: int, content: str
+        self,
+        *,
+        conversation_id: int,
+        user_id: int,
+        content: str,
+        attachment_ids: list[int] | None = None,
+        search_mode: str = "off",
     ) -> PreparedTurn:
         settings = get_settings()
+        search_mode = "auto" if search_mode == "auto" else "off"
         async with self.session_factory() as session:
             conversations = ConversationRepository(session)
             conversation = await conversations.get_owned(conversation_id, user_id)
             if conversation is None:
                 raise ConversationNotFound()
+
+            # 先检索，再写消息：检索失败不会留下孤儿消息。
+            attachments, sources, rag_block = await self._prepare_rag(
+                session=session,
+                settings=settings,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                query=content,
+                attachment_ids=attachment_ids,
+                strict=True,
+            )
 
             messages = MessageRepository(session)
             # 插入之前先看一眼有没有历史，用来判断是不是首轮。
@@ -123,8 +259,17 @@ class ChatService:
             is_first_turn = not existing
             title_is_default = conversation.title == DEFAULT_CONVERSATION_TITLE
 
+            user_metadata: dict[str, Any] = {"search_mode": search_mode}
+            if attachments:
+                user_metadata["attachments"] = [
+                    attachment_snapshot(item) for item in attachments
+                ]
             user_message = await messages.create(
-                conversation_id, role=MSG_ROLE_USER, content=content, status=STATUS_COMPLETE
+                conversation_id,
+                role=MSG_ROLE_USER,
+                content=content,
+                status=STATUS_COMPLETE,
+                metadata_json=user_metadata,
             )
             assistant_message = await messages.create(
                 conversation_id, role=ROLE_ASSISTANT, content="", status=STATUS_STREAMING
@@ -134,11 +279,18 @@ class ChatService:
             history = await messages.list_recent(conversation_id, limit=HISTORY_FETCH_LIMIT)
             await session.commit()
 
+        system_prompt = get_system_prompt("chat")
+        if rag_block:
+            system_prompt = f"{system_prompt}\n\n{rag_block}"
+        # 系统提示词本身也占预算；联网搜索模式还要为网页资料预留空间。
+        context_budget = settings.context_max_chars - len(system_prompt)
+        if search_mode == "auto":
+            context_budget -= settings.search_context_max_chars
         provider_messages = build_context(
             history,
-            system_prompt=get_system_prompt("chat"),
+            system_prompt=system_prompt,
             max_messages=settings.context_max_messages,
-            max_chars=settings.context_max_chars,
+            max_chars=max(0, context_budget),
         )
         return PreparedTurn(
             conversation_id=conversation_id,
@@ -148,6 +300,9 @@ class ChatService:
             is_first_turn=is_first_turn,
             first_user_content=content,
             title_is_default=title_is_default,
+            sources=sources,
+            query=content,
+            search_mode=search_mode,
         )
 
     async def prepare_regenerate(self, *, conversation_id: int, user_id: int) -> PreparedTurn:
@@ -166,6 +321,26 @@ class ChatService:
             if last_user is None:
                 raise ValidationAppError("这个会话还没有用户提问")
 
+            # 重新生成复用上一条用户消息附带的文件快照；已删除或已解绑的
+            # 附件在 strict=False 下直接跳过，不阻断重新生成。
+            raw_attachments = (last_user.metadata_json or {}).get("attachments", [])
+            attachment_ids = [
+                item.get("id")
+                for item in raw_attachments
+                if isinstance(item, dict) and isinstance(item.get("id"), int)
+            ]
+            raw_mode = (last_user.metadata_json or {}).get("search_mode", "off")
+            search_mode = "auto" if raw_mode == "auto" else "off"
+            _, sources, rag_block = await self._prepare_rag(
+                session=session,
+                settings=settings,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                query=last_user.content or "",
+                attachment_ids=attachment_ids,
+                strict=False,
+            )
+
             # 硬删旧的助手回答：保持 messages.id 单调，也避免多轮重新生成后
             # 残留一堆被覆盖的历史回答。上下文用「截至最后一条用户消息」组装，
             # 因此自然不含被删掉的那条。
@@ -180,11 +355,17 @@ class ChatService:
             )
             await session.commit()
 
+        system_prompt = get_system_prompt("chat")
+        if rag_block:
+            system_prompt = f"{system_prompt}\n\n{rag_block}"
+        context_budget = settings.context_max_chars - len(system_prompt)
+        if search_mode == "auto":
+            context_budget -= settings.search_context_max_chars
         provider_messages = build_context(
             history,
-            system_prompt=get_system_prompt("chat"),
+            system_prompt=system_prompt,
             max_messages=settings.context_max_messages,
-            max_chars=settings.context_max_chars,
+            max_chars=max(0, context_budget),
         )
         return PreparedTurn(
             conversation_id=conversation_id,
@@ -195,17 +376,33 @@ class ChatService:
             is_first_turn=False,
             first_user_content=last_user.content,
             title_is_default=False,
+            sources=sources,
+            query=last_user.content or "",
+            search_mode=search_mode,
         )
 
     # --- 流式执行 ---
 
+    async def _search(self, query: str) -> SearchOutcome:
+        """联网搜索永远不能把异常抛进聊天流。"""
+        try:
+            return await self.search_service.search(query, mode="auto")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("联网搜索出现未预期异常")
+            return SearchOutcome(status="unavailable", message="联网搜索暂时不可用")
+
     async def run_turn(
         self, prepared: PreparedTurn, request: Request
     ) -> AsyncIterator[tuple[str, dict]]:
+        settings = get_settings()
         chunks: list[str] = []
         usage: ChatUsage | None = None
         finish_reason: str | None = None
         status = STATUS_COMPLETE
+        sources = list(prepared.sources)
+        tool_statuses: list[dict[str, Any]] = []
 
         try:
             yield "message_start", {
@@ -213,8 +410,66 @@ class ChatService:
                 "assistant_message_id": prepared.assistant_message_id,
             }
 
+            if prepared.search_mode == "auto":
+                # 搜索是外部调用，先让前端知道正在做什么。
+                yield "tool_status", {"tool": "web_search", "status": "running"}
+
+            # 文件来源已经准备好，先发；web 来源在搜索成功后追加。
+            for source in sources:
+                yield "source", source
+
+            provider_messages = prepared.provider_messages
+            if prepared.search_mode == "auto":
+                outcome = await self._search(prepared.query)
+                extra_prompt: str | None
+                if outcome.status == "ok":
+                    web_sources = build_web_source_payloads(
+                        outcome.results,
+                        snippet_chars=settings.search_snippet_chars,
+                    )
+                    sources.extend(web_sources)
+                    for payload in web_sources:
+                        yield "source", payload
+                    extra_prompt = build_web_block(
+                        outcome.results,
+                        max_chars=settings.search_context_max_chars,
+                        intent=outcome.intent,
+                    )
+                elif outcome.status == "empty":
+                    extra_prompt = build_web_empty_block(outcome.message)
+                else:
+                    extra_prompt = build_web_unavailable_block(outcome.message)
+
+                terminal = {
+                    "tool": "web_search",
+                    "status": {"ok": "done", "empty": "empty"}.get(
+                        outcome.status, "unavailable"
+                    ),
+                    "message": outcome.message,
+                    "provider": outcome.provider,
+                }
+                tool_statuses.append(terminal)
+                yield "tool_status", terminal
+
+                # 搜索期间用户可能已经点了停止；此时不再调用模型。
+                if await request.is_disconnected():
+                    await self._finalize_safely(
+                        prepared,
+                        "".join(chunks),
+                        STATUS_INTERRUPTED,
+                        usage,
+                        "interrupted",
+                        sources=sources,
+                        tool_statuses=tool_statuses,
+                    )
+                    return
+
+                provider_messages = merge_web_context(
+                    prepared.provider_messages, extra_prompt
+                )
+
             async for event in self.provider.stream_chat(
-                prepared.provider_messages, self._options_factory()
+                provider_messages, self._options_factory()
             ):
                 # 主动检查断开：前端点「停止生成」后，这里是最先能感知到的地方。
                 # 走这条路不抛异常，能干净地收尾。
@@ -231,6 +486,10 @@ class ChatService:
                 elif event.type == "done":
                     finish_reason = event.finish_reason or "stop"
 
+            citation_report = None
+            if settings.rag_citation_validation and sources:
+                citation_report = validate_citations("".join(chunks), sources)
+
             if status == STATUS_COMPLETE:
                 finish_reason = finish_reason or "stop"
                 yield "message_end", {
@@ -241,7 +500,13 @@ class ChatService:
         except asyncio.CancelledError:
             # 兜底路径：客户端硬断（关标签页）时 Starlette 会取消这个任务。
             await self._finalize_safely(
-                prepared, "".join(chunks), STATUS_INTERRUPTED, usage, "interrupted"
+                prepared,
+                "".join(chunks),
+                STATUS_INTERRUPTED,
+                usage,
+                "interrupted",
+                sources=sources,
+                tool_statuses=tool_statuses,
             )
             # 必须重新抛出——吞掉 CancelledError 会破坏 ASGI 的取消语义。
             raise
@@ -257,7 +522,13 @@ class ChatService:
                 "request_id": get_request_id(),
             }
             await self._finalize_safely(
-                prepared, "".join(chunks), STATUS_FAILED, usage, "error"
+                prepared,
+                "".join(chunks),
+                STATUS_FAILED,
+                usage,
+                "error",
+                sources=sources,
+                tool_statuses=tool_statuses,
             )
             yield "message_end", {"finish_reason": "error", "usage": dump_usage(usage)}
             return
@@ -272,13 +543,26 @@ class ChatService:
                 "request_id": get_request_id(),
             }
             await self._finalize_safely(
-                prepared, "".join(chunks), STATUS_FAILED, usage, "error"
+                prepared,
+                "".join(chunks),
+                STATUS_FAILED,
+                usage,
+                "error",
+                sources=sources,
+                tool_statuses=tool_statuses,
             )
             yield "message_end", {"finish_reason": "error", "usage": dump_usage(usage)}
             return
 
         await self._finalize_safely(
-            prepared, "".join(chunks), status, usage, finish_reason or "stop"
+            prepared,
+            "".join(chunks),
+            status,
+            usage,
+            finish_reason or "stop",
+            sources=sources,
+            tool_statuses=tool_statuses,
+            citation_report=citation_report,
         )
 
     async def _finalize_safely(
@@ -288,6 +572,10 @@ class ChatService:
         status: str,
         usage: ChatUsage | None,
         finish_reason: str | None,
+        *,
+        sources: list[dict[str, Any]] | None = None,
+        tool_statuses: list[dict[str, Any]] | None = None,
+        citation_report: dict[str, Any] | None = None,
     ) -> None:
         """回填助手消息。用独立 session，且不让写库失败影响流的收尾。"""
         metadata: dict = {}
@@ -295,6 +583,16 @@ class ChatService:
             metadata["finish_reason"] = finish_reason
         if usage is not None:
             metadata["usage"] = usage.as_dict()
+        # 来源在失败/中断时也保留，刷新历史后仍能看到引用过哪些片段。
+        if sources is None:
+            sources = prepared.sources
+        if sources:
+            metadata["sources"] = list(sources)
+        # running 是瞬态状态，不落库；只保存 done/empty/unavailable。
+        if tool_statuses:
+            metadata["tool_statuses"] = list(tool_statuses)
+        if citation_report:
+            metadata["citation_report"] = citation_report
 
         async def write() -> None:
             async with self.session_factory() as session:

@@ -8,11 +8,13 @@ import MessageList from '../components/chat/MessageList.vue'
 import AppLayout from '../components/layout/AppLayout.vue'
 import { useChatStore } from '../stores/chat'
 import { useConversationsStore } from '../stores/conversations'
+import type { SearchMode } from '../types/chat'
+import type { UploadedFile } from '../types/file'
 
 const conversations = useConversationsStore()
 const chat = useChatStore()
 
-const { currentId } = storeToRefs(conversations)
+const { currentId, capabilities } = storeToRefs(conversations)
 const { messages, loading, streaming, error } = storeToRefs(chat)
 
 onMounted(async () => {
@@ -32,7 +34,11 @@ watch(currentId, async (conversationId) => {
   await chat.loadMessages(conversationId)
 })
 
-async function handleSend(content: string): Promise<void> {
+async function handleSend(
+  content: string,
+  attachments: UploadedFile[],
+  searchMode: SearchMode,
+): Promise<void> {
   let conversationId = currentId.value
   // 还没有会话时直接开聊：自动建一个再发。
   if (conversationId === null) {
@@ -40,7 +46,7 @@ async function handleSend(content: string): Promise<void> {
     if (!created) return
     conversationId = created.id
   }
-  await chat.sendMessage(conversationId, content)
+  await chat.sendMessage(conversationId, content, attachments, searchMode)
 }
 
 async function handleRegenerate(): Promise<void> {
@@ -64,6 +70,13 @@ async function handleRegenerate(): Promise<void> {
       @dismiss-error="chat.clearError()"
     />
 
-    <ChatInput :disabled="streaming" :streaming="streaming" @send="handleSend" @stop="chat.stop()" />
+    <ChatInput
+      :disabled="streaming"
+      :streaming="streaming"
+      :conversation-id="currentId"
+      :web-search-available="capabilities?.web_search ?? true"
+      @send="handleSend"
+      @stop="chat.stop()"
+    />
   </AppLayout>
 </template>

@@ -22,7 +22,11 @@ from app.api.v1.endpoints import health
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging, new_request_id, set_request_id
-from app.db.seed import ensure_dev_user, fail_orphan_streaming_messages
+from app.db.seed import (
+    ensure_dev_user,
+    fail_orphan_parsing_attachments,
+    fail_orphan_streaming_messages,
+)
 from app.db.session import dispose_engine
 
 logger = logging.getLogger(__name__)
@@ -85,6 +89,7 @@ async def lifespan(_: FastAPI):
     # /health 会如实报告数据库不可用，方便定位问题。
     try:
         await fail_orphan_streaming_messages()
+        await fail_orphan_parsing_attachments()
         await ensure_dev_user()
     except Exception as exc:  # noqa: BLE001
         logger.warning("启动时数据准备失败，服务仍会启动：%s", exc)

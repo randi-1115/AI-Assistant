@@ -34,9 +34,9 @@ async def test_capabilities_are_honest_about_unimplemented_features(client: Asyn
     # mock provider 支持文本聊天与流式
     assert body["text_chat"] is True
     assert body["streaming"] is True
-    # 没实现的一律 false，不能假装可用
+    # 文件问答已实现；其余未实现的一律 false，不能假装可用
     assert body["web_search"] is False
-    assert body["document_qa"] is False
+    assert body["document_qa"] is True
     assert body["memory"] is False
     assert body["vision"] is False
 

@@ -1,6 +1,6 @@
 """日志配置与请求 ID 上下文。
 
-每个请求都会被分配一个 request_id（见 main.py 的中间件），写入 ContextVar，
+每个请求都会被分配一个 request_id(见 main.py 的中间件)，写入 ContextVar,
 再由日志 Filter 注入每条日志，最后由统一错误处理返回给前端。
 这样前端看到的错误提示能和后端日志一一对应，同时不必暴露内部细节。
 
@@ -16,7 +16,7 @@ import uuid
 from contextvars import ContextVar
 from typing import Any
 
-_request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+_request_id_var: ContextVar[str] = ContextVar("request_id", default="-")# 请求 ID 上下文变量
 
 LOG_FORMAT = "%(asctime)s %(levelname)-5s [%(request_id)s] %(name)s: %(message)s"
 

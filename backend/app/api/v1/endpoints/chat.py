@@ -16,6 +16,7 @@ from app.ai.providers.registry import llm_provider_dep
 from app.api.deps import get_current_user_id
 from app.api.v1.sse import sse_stream
 from app.schemas.chat import ChatStreamRequest
+from app.search import SearchService, get_search_service
 from app.services.chat_service import ChatService, PreparedTurn
 
 router = APIRouter(prefix="/conversations", tags=["chat"])
@@ -46,10 +47,15 @@ async def stream_message(
     background_tasks: BackgroundTasks,
     user_id: int = Depends(get_current_user_id),
     provider: LLMProvider = Depends(llm_provider_dep),
+    search: SearchService = Depends(get_search_service),
 ) -> StreamingResponse:
-    service = ChatService(provider)
+    service = ChatService(provider, search_service=search)
     prepared = await service.prepare_send(
-        conversation_id=conversation_id, user_id=user_id, content=payload.content
+        conversation_id=conversation_id,
+        user_id=user_id,
+        content=payload.content,
+        attachment_ids=payload.attachment_ids,
+        search_mode=payload.search_mode.value,
     )
 
     # 首轮对话结束后自动起标题。用 BackgroundTasks 而不是 asyncio.create_task：
@@ -70,8 +76,9 @@ async def regenerate_message(
     request: Request,
     user_id: int = Depends(get_current_user_id),
     provider: LLMProvider = Depends(llm_provider_dep),
+    search: SearchService = Depends(get_search_service),
 ) -> StreamingResponse:
-    service = ChatService(provider)
+    service = ChatService(provider, search_service=search)
     prepared = await service.prepare_regenerate(
         conversation_id=conversation_id, user_id=user_id
     )

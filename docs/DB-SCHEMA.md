@@ -74,6 +74,8 @@ users 1 ── 1 user_settings
 - `error_message TEXT NULL`
 - `created_at DATETIME(3) NOT NULL`
 - 索引：`(user_id, created_at)`、`(conversation_id)`
+- 外键行为：`user_id` 随用户删除级联；`conversation_id` 随会话删除级联（磁盘文件由应用层同步清理）。上传时还没有会话的附件在首次作为聊天附件使用时归属到当前会话。
+- 阶段 2 只在当前用户显式附带 `attachment_ids` 的文件范围内检索；不做跨会话复用。
 
 ### `document_chunks` — 文档分块
 
@@ -86,8 +88,9 @@ users 1 ── 1 user_settings
 - `metadata_json JSON NULL`
 - `created_at DATETIME(3) NOT NULL`
 - 唯一索引：`(attachment_id, chunk_index)`
+- 外键行为：`attachment_id` 随附件删除级联。
 
-首版可对检索候选执行关键词重合度评分；表结构不意味着已经接入 embedding 或向量数据库。
+首版对检索候选执行关键词重合度评分（中文二元组 + 英文/代码词，覆盖率/词频/短语/文件名加权）；表结构不意味着已经接入 embedding 或向量数据库。当前实现没有全文索引，候选块按用户与附件范围取出后在应用层打分。
 
 ### `user_memories` — 长期记忆
 

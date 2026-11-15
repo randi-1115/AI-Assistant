@@ -52,15 +52,41 @@ export interface SSEErrorPayload {
   request_id: string
 }
 
-export interface SourcePayload {
+interface SourceBase {
   title: string
-  url: string
-  snippet?: string
+  url: string | null
+  snippet: string | null
 }
+
+/** 文件来源：阶段 2 的主体。file 没有下载端点，url 固定为 null。 */
+export interface FileSourcePayload extends SourceBase {
+  kind: 'file'
+  file_id: number
+  chunk_index: number
+  section_title: string | null
+  score: number
+  excerpt_number?: number | null
+  citation_label?: string | null
+}
+
+/** 联网搜索来源：阶段 3 使用，阶段 2 不会收到。 */
+export interface WebSourcePayload extends SourceBase {
+  kind: 'web'
+  url: string
+  published_date?: string | null
+  domain?: string | null
+  score?: number | null
+}
+
+export type SourcePayload = FileSourcePayload | WebSourcePayload
+
+export type ToolStatus = 'running' | 'done' | 'empty' | 'unavailable'
 
 export interface ToolStatusPayload {
   tool: string
-  status: string
+  status: ToolStatus
+  message?: string | null
+  provider?: string | null
 }
 
 /** 流式回调。P0 只用到 message_start / token / message_end / error；

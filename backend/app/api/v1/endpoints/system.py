@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends
 
 from app.ai.providers.base import Capability, LLMProvider
 from app.ai.providers.registry import llm_provider_dep
+from app.core.config import get_settings
+from app.search import search_available
 
 router = APIRouter(tags=["system"])
 
@@ -23,8 +25,8 @@ async def capabilities(provider: LLMProvider = Depends(llm_provider_dep)) -> dic
         "streaming": provider.supports(Capability.STREAMING),
         "vision": provider.supports(Capability.VISION),
         "tool_calling": provider.supports(Capability.TOOL_CALLING),
-        # P1 及以后才实现。
-        "web_search": False,
-        "document_qa": False,
+        # 文件问答已实现；联网搜索取决于是否配置了真实 key。
+        "web_search": search_available(get_settings()),
+        "document_qa": True,
         "memory": False,
     }

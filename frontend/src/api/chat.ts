@@ -8,9 +8,11 @@ import type {
   ChatStreamRequest,
   MessageEndPayload,
   MessageStartPayload,
+  SourcePayload,
   SSEErrorPayload,
   SSEHandlers,
   TokenPayload,
+  ToolStatusPayload,
 } from '../types/chat'
 import { apiUrl, toApiError } from './http'
 import { SSEParser } from './sse'
@@ -65,8 +67,10 @@ async function streamRequest(
           handlers.onError?.(data as SSEErrorPayload)
           break
         case 'source':
+          handlers.onSource?.(data as SourcePayload)
+          break
         case 'tool_status':
-          // P1 才会用到；P0 收到也不处理，但不要当作未知事件报错。
+          handlers.onToolStatus?.(data as ToolStatusPayload)
           break
         default:
           break

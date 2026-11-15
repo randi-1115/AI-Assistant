@@ -1,0 +1,4 @@
+{"doc":"generic","question":"总结这个文件","expected_keywords":["神经网络","反向传播"]}
+{"doc":"heading","question":"反向传播是什么","expected_keywords":["反向传播"]}
+{"doc":"table","question":"学习率是多少","expected_keywords":["学习率","0.01"]}
+{"doc":"text","question":"项目代号是什么","expected_keywords":["蓝鲸"]}

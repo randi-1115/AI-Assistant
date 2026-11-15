@@ -1,0 +1,5 @@
+{"query":"最近一周AI圈有什么新闻","expect":{"intent":"news","min_domains":3,"fresh_days":7}}
+{"query":"DeepSeek 最近发布了什么模型","expect":{"intent":"entity_update","fresh_days":30}}
+{"query":"2026年11月12日 AI 新闻","expect":{"intent":"news","date":"2026-11-12"}}
+{"query":"英伟达最新股价","expect":{"intent":"realtime_data","must_warn":true}}
+{"query":"Transformer 和 Mamba 的区别","expect":{"intent":"evergreen"}}

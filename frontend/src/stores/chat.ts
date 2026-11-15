@@ -12,8 +12,14 @@ import { computed, ref } from 'vue'
 
 import { isAbortError, regenerateChat, streamChat } from '../api/chat'
 import * as api from '../api/conversations'
-import type { SSEHandlers } from '../types/chat'
+import type {
+  SearchMode,
+  SourcePayload,
+  SSEHandlers,
+  ToolStatusPayload,
+} from '../types/chat'
 import { DEFAULT_CONVERSATION_TITLE } from '../types/conversation'
+import type { MessageAttachment, UploadedFile } from '../types/file'
 import type { Message } from '../types/message'
 import { describeError, useConversationsStore } from './conversations'
 
@@ -62,7 +68,21 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  function pushMessage(partial: Pick<Message, 'conversation_id' | 'role' | 'content' | 'status'>): Message {
+  function attachmentSnapshot(file: UploadedFile): MessageAttachment {
+    return {
+      id: file.file_id,
+      name: file.original_name,
+      parse_status: file.parse_status,
+      supported_for_qa: file.supported_for_qa,
+      error_message: file.error_message ?? undefined,
+    }
+  }
+
+  function pushMessage(
+    partial: Pick<Message, 'conversation_id' | 'role' | 'content' | 'status'> & {
+      metadata_json?: Record<string, unknown> | null
+    },
+  ): Message {
     // 本地追加消息即视为「用户已经开始新的交互」，作废任何在途的历史加载。
     loadToken += 1
     const now = new Date().toISOString()
@@ -74,7 +94,7 @@ export const useChatStore = defineStore('chat', () => {
       status: partial.status,
       model_provider: null,
       model_name: null,
-      metadata_json: null,
+      metadata_json: partial.metadata_json ?? null,
       created_at: now,
     })
     // 必须从数组里取回响应式代理：直接改原始对象不会触发视图更新。
@@ -91,6 +111,9 @@ export const useChatStore = defineStore('chat', () => {
     error.value = null
     const abort = new AbortController()
     controller = abort
+    const sources: SourcePayload[] = []
+    const toolStatuses: ToolStatusPayload[] = []
+    let runningStatus: ToolStatusPayload | null = null
 
     const handlers: SSEHandlers = {
       onMessageStart: (payload) => {
@@ -100,6 +123,29 @@ export const useChatStore = defineStore('chat', () => {
       },
       onToken: ({ text }) => {
         assistantMessage.content += text
+      },
+      onSource: (payload) => {
+        sources.push(payload)
+        // 来源逐条到达，边流式输出边展示；流结束后后端也会落库同样的结构。
+        assistantMessage.metadata_json = {
+          ...(assistantMessage.metadata_json ?? {}),
+          sources: [...sources],
+        }
+      },
+      onToolStatus: (payload) => {
+        // running 只是瞬态展示；终态才写入消息元数据。
+        if (payload.status === 'running') {
+          runningStatus = payload
+        } else {
+          toolStatuses.push(payload)
+          runningStatus = null
+        }
+        assistantMessage.metadata_json = {
+          ...(assistantMessage.metadata_json ?? {}),
+          tool_statuses: runningStatus
+            ? [...toolStatuses, runningStatus]
+            : [...toolStatuses],
+        }
       },
       onMessageEnd: ({ finish_reason }) => {
         assistantMessage.status = finish_reason === 'error' ? 'failed' : 'complete'
@@ -125,6 +171,14 @@ export const useChatStore = defineStore('chat', () => {
         assistantMessage.status = 'failed'
       }
     } finally {
+      // 中断/出错时不要留下永远「搜索中」的状态。
+      if (runningStatus) {
+        runningStatus = null
+        assistantMessage.metadata_json = {
+          ...(assistantMessage.metadata_json ?? {}),
+          tool_statuses: [...toolStatuses],
+        }
+      }
       controller = null
       streaming.value = false
 
@@ -140,13 +194,24 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function sendMessage(conversationId: number, content: string): Promise<void> {
+  async function sendMessage(
+    conversationId: number,
+    content: string,
+    attachments: UploadedFile[] = [],
+    searchMode: SearchMode = 'off',
+  ): Promise<void> {
     if (streaming.value) return
     const userMessage = pushMessage({
       conversation_id: conversationId,
       role: 'user',
       content,
       status: 'complete',
+      metadata_json: {
+        search_mode: searchMode,
+        ...(attachments.length
+          ? { attachments: attachments.map(attachmentSnapshot) }
+          : {}),
+      },
     })
     const assistantMessage = pushMessage({
       conversation_id: conversationId,
@@ -155,9 +220,20 @@ export const useChatStore = defineStore('chat', () => {
       status: 'streaming',
     })
 
+    const attachmentIds = attachments.map((file) => file.file_id)
     await runStream(
       conversationId,
-      (handlers, signal) => streamChat(conversationId, { content }, handlers, signal),
+      (handlers, signal) =>
+        streamChat(
+          conversationId,
+          {
+            content,
+            search_mode: searchMode,
+            ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}),
+          },
+          handlers,
+          signal,
+        ),
       userMessage,
       assistantMessage,
     )

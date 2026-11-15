@@ -16,6 +16,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
 SUPPORTED_LLM_PROVIDERS = ("mock", "deepseek")
+# 联网搜索只接两家：Tavily 为主，SerpApi 可选作为备源。
+SUPPORTED_SEARCH_PROVIDERS = ("none", "tavily", "serpapi")
 
 
 class Settings(BaseSettings):
@@ -66,8 +68,8 @@ class Settings(BaseSettings):
     dev_user_display_name: str = "本地开发用户"
 
     # --- mock provider（仅供离线开发与测试，不联网）---
-    mock_stream_delay_ms: int = 60
-    mock_chunk_size: int = 4
+    mock_stream_delay_ms: int = 60 # 模拟流式响应延迟，单位毫秒
+    mock_chunk_size: int = 4 # 模拟流式响应分块大小，单位字符
     mock_default_reply: str = (
         "这是 mock provider 的固定回答。当前 LLM_PROVIDER=mock，"
         "没有调用任何真实模型；把 .env 里的 LLM_PROVIDER 改成 deepseek 并填好 "
@@ -76,19 +78,57 @@ class Settings(BaseSettings):
     # 全局强制触发错误，用于手工验收错误分支：upstream|timeout|rate_limit|auth
     mock_force_error: str = ""
 
-    # --- 后续阶段占位（P0 未使用，保留键名以匹配 .env.example）---
+    # --- 联网搜索 ---
+    # none 表示关闭；tavily 为主源；serpapi 可选作为 fallback。
     search_provider: str = "none"
-    search_api_key: SecretStr = SecretStr("")
+    search_fallback_provider: str = ""
+    tavily_api_key: SecretStr = SecretStr("")
+    serpapi_api_key: SecretStr = SecretStr("")
+    search_timeout_seconds: float = 8.0
+    search_max_results: int = 5
+    search_snippet_chars: int = 300
+    search_context_max_chars: int = 3000
+
+    # --- 查询规划与质量硬化（P1.5）---
+    search_query_plan_enabled: bool = True
+    search_llm_planning_enabled: bool = True # 测试环境设 false
+    search_planner_timeout_seconds: float = 5.0
+    search_planner_max_tokens: int = 256
+    search_subqueries_enabled: bool = True
+    search_max_subqueries: int = 2
+    search_fetch_results: int = 10 # 过取数量，最终仍取 search_max_results
+    search_per_domain_max_results: int = 2
+    search_total_timeout_seconds: float = 12.0
+    search_cache_ttl_seconds: int = 300
+    search_cache_max_entries: int = 128
+    search_extra_authority_domains: str = ""
+    search_include_raw_content: bool = True
+    search_content_chars: int = 1200
+
+    # --- 本地文件 ---
     upload_dir: str = "../data/uploads"
-    max_upload_mb: int = 20
-    rag_top_k: int = 4
-    agent_max_tool_calls: int = 3
+    max_upload_mb: int = 20 # 最大上传文件大小，单位 MB
+    rag_top_k: int = 4 # RAG 模型返回的 top-k 个文档
+    agent_max_tool_calls: int = 3 # 智能体最大调用工具次数
+
+    # --- 文档解析与切块（阶段 P1：文件上传 + 轻量 RAG）---
+    rag_chunk_size_chars: int = 800 # 单个文本块的目标长度（字符）
+    rag_chunk_overlap_chars: int = 100 # 相邻块重叠长度（字符）
+    rag_max_chunks_per_file: int = 500 # 单文件最多切多少块，防止超大文件打爆库
+    rag_max_extracted_chars: int = 1_000_000 # 单文件最多保留多少字符
+    rag_max_candidate_chunks: int = 2000 # 单次检索最多从库里捞多少候选块
+    rag_candidates_per_file: int = 400 # 每个附件最多取多少候选，避免旧文件被挤掉
+    rag_context_max_chars: int = 4000 # 拼进提示词的资料片段总预算
+    rag_source_snippet_chars: int = 300 # SSE / 元数据里的来源摘要长度
+    rag_max_excerpts_per_file: int = 2 # 多文件时每个文件最多进几个 excerpt
+    rag_citation_validation: bool = True # 记录回答里的 [资料 N] 是否有效
+    rag_synonym_expansion: bool = False # 同义词扩展默认关闭
 
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
-    @model_validator(mode="after")
+    @model_validator(mode="after") # 检查 LLM 配置是否合法
     def _check_llm_config(self) -> "Settings":
         if self.llm_provider not in SUPPORTED_LLM_PROVIDERS:
             raise ValueError(
@@ -104,6 +144,68 @@ class Settings(BaseSettings):
                     "LLM_PROVIDER=deepseek 时必须配置 LLM_MODEL"
                     "（可先请求 GET {LLM_BASE_URL}/models 确认可用模型名）"
                 )
+        return self
+
+    @model_validator(mode="after")  # 检查 RAG 参数是否自洽
+    def _check_rag_config(self) -> "Settings":
+        if self.rag_chunk_size_chars <= 0:
+            raise ValueError("RAG_CHUNK_SIZE_CHARS 必须大于 0")
+        if not 0 <= self.rag_chunk_overlap_chars < self.rag_chunk_size_chars:
+            raise ValueError("RAG_CHUNK_OVERLAP_CHARS 必须在 [0, RAG_CHUNK_SIZE_CHARS) 内")
+        if self.rag_top_k < 1:
+            raise ValueError("RAG_TOP_K 必须大于等于 1")
+        if self.rag_max_chunks_per_file < 1:
+            raise ValueError("RAG_MAX_CHUNKS_PER_FILE 必须大于等于 1")
+        if self.rag_max_extracted_chars < 1:
+            raise ValueError("RAG_MAX_EXTRACTED_CHARS 必须大于等于 1")
+        if self.rag_max_candidate_chunks < 1:
+            raise ValueError("RAG_MAX_CANDIDATE_CHUNKS 必须大于等于 1")
+        if not 1 <= self.rag_candidates_per_file <= self.rag_max_candidate_chunks:
+            raise ValueError("RAG_CANDIDATES_PER_FILE 必须在 [1, RAG_MAX_CANDIDATE_CHUNKS] 内")
+        if self.rag_max_excerpts_per_file < 1:
+            raise ValueError("RAG_MAX_EXCERPTS_PER_FILE 必须大于等于 1")
+        if not 0 < self.rag_context_max_chars <= 20000:
+            raise ValueError("RAG_CONTEXT_MAX_CHARS 必须在 (0, 20000] 内")
+        if not 0 < self.rag_source_snippet_chars <= 2000:
+            raise ValueError("RAG_SOURCE_SNIPPET_CHARS 必须在 (0, 2000] 内")
+        return self
+
+    @model_validator(mode="after")  # 检查联网搜索参数是否自洽
+    def _check_search_config(self) -> "Settings":
+        if self.search_provider not in SUPPORTED_SEARCH_PROVIDERS:
+            raise ValueError(
+                f"SEARCH_PROVIDER 取值非法：{self.search_provider!r}，"
+                f"只支持 {SUPPORTED_SEARCH_PROVIDERS}"
+            )
+        if self.search_fallback_provider and (
+            self.search_fallback_provider not in SUPPORTED_SEARCH_PROVIDERS
+            or self.search_fallback_provider == "none"
+        ):
+            raise ValueError("SEARCH_FALLBACK_PROVIDER 只能是 tavily 或 serpapi，或留空")
+        if not 0 < self.search_timeout_seconds <= 30:
+            raise ValueError("SEARCH_TIMEOUT_SECONDS 必须在 (0, 30] 内")
+        if not 1 <= self.search_max_results <= 10:
+            raise ValueError("SEARCH_MAX_RESULTS 必须在 [1, 10] 内")
+        if not 0 < self.search_snippet_chars <= 1000:
+            raise ValueError("SEARCH_SNIPPET_CHARS 必须在 (0, 1000] 内")
+        if not 0 < self.search_context_max_chars <= 8000:
+            raise ValueError("SEARCH_CONTEXT_MAX_CHARS 必须在 (0, 8000] 内")
+        if not self.search_max_results <= self.search_fetch_results <= 20:
+            raise ValueError("SEARCH_FETCH_RESULTS 必须在 [SEARCH_MAX_RESULTS, 20] 内")
+        if not 0 < self.search_total_timeout_seconds <= 30:
+            raise ValueError("SEARCH_TOTAL_TIMEOUT_SECONDS 必须在 (0, 30] 内")
+        if self.search_per_domain_max_results < 1:
+            raise ValueError("SEARCH_PER_DOMAIN_MAX_RESULTS 必须大于等于 1")
+        if not 0 <= self.search_content_chars <= 5000:
+            raise ValueError("SEARCH_CONTENT_CHARS 必须在 [0, 5000] 内")
+        if not 0 <= self.search_max_subqueries <= 5:
+            raise ValueError("SEARCH_MAX_SUBQUERIES 必须在 [0, 5] 内")
+        if not 0 <= self.search_cache_ttl_seconds <= 3600:
+            raise ValueError("SEARCH_CACHE_TTL_SECONDS 必须在 [0, 3600] 内")
+        if not 0 < self.search_planner_timeout_seconds <= 10:
+            raise ValueError("SEARCH_PLANNER_TIMEOUT_SECONDS 必须在 (0, 10] 内")
+        if not 64 <= self.search_planner_max_tokens <= 1024:
+            raise ValueError("SEARCH_PLANNER_MAX_TOKENS 必须在 [64, 1024] 内")
         return self
 
 

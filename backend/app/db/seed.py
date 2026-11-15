@@ -13,6 +13,7 @@ import logging
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
+from app.repositories.attachment_repo import AttachmentRepository
 from app.repositories.message_repo import MessageRepository
 from app.repositories.user_repo import UserRepository
 
@@ -38,4 +39,14 @@ async def fail_orphan_streaming_messages() -> int:
         await session.commit()
     if count:
         logger.warning("把 %s 条遗留的 streaming 消息标记为 failed", count)
+    return count
+
+
+async def fail_orphan_parsing_attachments() -> int:
+    """同步解析链路里，进程重启时不可能还有正在解析的附件。"""
+    async with SessionLocal() as session:
+        count = await AttachmentRepository(session).fail_incomplete()
+        await session.commit()
+    if count:
+        logger.warning("把 %s 个未完成解析的附件标记为 failed", count)
     return count

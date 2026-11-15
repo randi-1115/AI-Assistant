@@ -1,0 +1,5 @@
+{"kind":"file","doc":"generic","query":"总结这个文件","expected_keywords":["神经网络","反向传播"]}
+{"kind":"file","doc":"heading","query":"反向传播是什么","expected_keywords":["反向传播"]}
+{"kind":"file","doc":"table","query":"学习率是多少","expected_keywords":["学习率","0.01"]}
+{"kind":"search","query":"最近一周AI圈有什么新闻","expect":{"intent":"news","min_domains":3}}
+{"kind":"search","query":"DeepSeek 最近发布了什么模型","expect":{"intent":"entity_update"}}

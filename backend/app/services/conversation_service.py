@@ -5,22 +5,36 @@
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConversationNotFound
 from app.models.conversation import Conversation
 from app.models.message import Message
+from app.repositories.attachment_repo import AttachmentRepository
 from app.repositories.conversation_repo import ConversationRepository
 from app.repositories.message_repo import MessageRepository
+from app.storage import get_storage
+from app.storage.base import StorageBackend, StorageError
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MESSAGE_PAGE_SIZE = 50
 
 
 class ConversationService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        storage: StorageBackend | None = None,
+    ) -> None:
         self.session = session
         self.conversations = ConversationRepository(session)
         self.messages = MessageRepository(session)
+        self.attachments = AttachmentRepository(session)
+        self.storage = storage or get_storage()
 
     async def list_conversations(
         self, user_id: int, *, keyword: str | None = None, page: int = 1, page_size: int = 20
@@ -51,10 +65,24 @@ class ConversationService:
         return conversation
 
     async def delete_conversation(self, conversation_id: int, user_id: int) -> None:
+        conversation = await self.conversations.get_owned(conversation_id, user_id)
+        if conversation is None:
+            raise ConversationNotFound()
+        # 数据库外键会级联删除附件与分块，但删不掉磁盘文件。先取出 key，
+        # 提交后再做 best-effort 物理删除。
+        storage_keys = await self.attachments.list_storage_keys_by_conversation(
+            conversation_id, user_id
+        )
         deleted = await self.conversations.delete(conversation_id, user_id)
         if not deleted:
             raise ConversationNotFound()
         await self.session.commit()
+
+        for storage_key in storage_keys:
+            try:
+                await self.storage.delete(storage_key)
+            except StorageError:
+                logger.warning("删除会话时清理磁盘文件失败 key=%s", storage_key)
 
     async def list_messages(
         self,
