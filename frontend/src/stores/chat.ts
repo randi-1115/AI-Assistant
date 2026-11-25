@@ -13,6 +13,7 @@ import { computed, ref } from 'vue'
 import { isAbortError, regenerateChat, streamChat } from '../api/chat'
 import * as api from '../api/conversations'
 import type {
+  AgentMode,
   SearchMode,
   SourcePayload,
   SSEHandlers,
@@ -199,6 +200,7 @@ export const useChatStore = defineStore('chat', () => {
     content: string,
     attachments: UploadedFile[] = [],
     searchMode: SearchMode = 'off',
+    agentMode: AgentMode = 'off',
   ): Promise<void> {
     if (streaming.value) return
     const userMessage = pushMessage({
@@ -208,6 +210,7 @@ export const useChatStore = defineStore('chat', () => {
       status: 'complete',
       metadata_json: {
         search_mode: searchMode,
+        agent_mode: agentMode,
         ...(attachments.length
           ? { attachments: attachments.map(attachmentSnapshot) }
           : {}),
@@ -229,6 +232,7 @@ export const useChatStore = defineStore('chat', () => {
           {
             content,
             search_mode: searchMode,
+            agent_mode: agentMode,
             ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}),
           },
           handlers,

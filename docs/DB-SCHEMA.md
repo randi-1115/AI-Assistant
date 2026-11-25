@@ -113,11 +113,14 @@ users 1 ── 1 user_settings
 - `tool_name VARCHAR(100) NOT NULL`
 - `input_json JSON NULL`
 - `output_summary TEXT NULL`
-- `status VARCHAR(20) NOT NULL`：`running`、`success`、`failed`、`timeout`
+- `status VARCHAR(20) NOT NULL`：`success`、`failed`、`timeout`
+- `error_code VARCHAR(100) NULL`：稳定的机器码，例如 `invalid_arguments`、`unknown_tool`、`tool_budget_exceeded`
 - `error_message TEXT NULL`
 - `duration_ms INT UNSIGNED NULL`
 - `created_at DATETIME(3) NOT NULL`
 - 索引：`(message_id, created_at)`
+
+> 已实现（迁移 `c1d2e3f4a5b6`）。只写**终态**：`running` 是流式瞬态，没有可更新的独立行，写进去只会留下永远不结束的记录。`input_json` / `output_summary` 是摘要，不保存完整工具输出。删除消息/会话时 `tool_runs` 级联删除。
 
 ## 建表原则
 

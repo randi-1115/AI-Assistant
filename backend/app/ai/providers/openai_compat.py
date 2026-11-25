@@ -29,6 +29,7 @@ from app.ai.providers.base import (
     ChatUsage,
     LLMProvider,
     StreamEvent,
+    ToolCall,
 )
 from app.core.errors import (
     LLMAuthError,
@@ -47,7 +48,9 @@ MAX_LOGGED_BODY_CHARS = 500
 
 
 class OpenAICompatibleProvider(LLMProvider):
-    _capabilities = frozenset({Capability.TEXT_CHAT, Capability.STREAMING})
+    _capabilities = frozenset(
+        {Capability.TEXT_CHAT, Capability.STREAMING, Capability.TOOL_CALLING}
+    )
 
     def __init__(
         self,
@@ -75,16 +78,37 @@ class OpenAICompatibleProvider(LLMProvider):
 
     # --- 内部 ---
 
-    def _client(self) -> httpx.AsyncClient:
+    def _client(self, timeout_seconds: float | None = None) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=self.base_url,
-            timeout=httpx.Timeout(self.timeout_seconds),
+            # 单次调用可以覆盖全局超时：agent 循环会用剩余时间预算收紧每一步。
+            timeout=httpx.Timeout(timeout_seconds or self.timeout_seconds),
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
             transport=self._transport,
         )
+
+    @staticmethod
+    def _message_payload(message: ChatMessage) -> dict[str, Any]:
+        """把内部消息转成 OpenAI chat.completions 的形状。"""
+        payload: dict[str, Any] = {"role": message.role}
+        if message.tool_calls:
+            payload["content"] = message.content or None
+            payload["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments},
+                }
+                for call in message.tool_calls
+            ]
+        else:
+            payload["content"] = message.content
+        if message.tool_call_id is not None:
+            payload["tool_call_id"] = message.tool_call_id
+        return payload
 
     def _build_payload(
         self,
@@ -96,11 +120,14 @@ class OpenAICompatibleProvider(LLMProvider):
         options = options or ChatOptions()
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [self._message_payload(m) for m in messages],
             "max_tokens": options.max_output_tokens or self.default_max_output_tokens,
         }
         if options.temperature is not None:
             payload["temperature"] = options.temperature
+        if options.tools:
+            payload["tools"] = list(options.tools)
+            payload["tool_choice"] = options.tool_choice or "auto"
         if stream:
             payload["stream"] = True
             # 拿不到用量时下面的解析会给出 usage=None，不会伪造。
@@ -131,17 +158,41 @@ class OpenAICompatibleProvider(LLMProvider):
             output_tokens=raw.get("completion_tokens"),
         )
 
-    def _parse_chunk(self, data: str) -> tuple[str | None, str | None, ChatUsage | None]:
-        """把一条 SSE data 解析成 (文本增量, finish_reason, usage)。"""
+    def _parse_chunk(
+        self, data: str
+    ) -> tuple[str | None, str | None, ChatUsage | None, list[dict[str, Any]]]:
+        """把一条 SSE data 解析成 (文本增量, finish_reason, usage, tool 增量)。"""
         payload = json.loads(data)
         usage = self._parse_usage(payload.get("usage"))
         choices = payload.get("choices") or []
         if not choices:
             # OpenAI 的 usage-only chunk 就是这个形状：choices 为空。
-            return None, None, usage
+            return None, None, usage, []
         choice = choices[0] or {}
         delta = choice.get("delta") or {}
-        return delta.get("content"), choice.get("finish_reason"), usage
+        tool_deltas = delta.get("tool_calls") or []
+        return (
+            delta.get("content"),
+            choice.get("finish_reason"),
+            usage,
+            tool_deltas if isinstance(tool_deltas, list) else [],
+        )
+
+    @staticmethod
+    def _parse_message_tool_calls(message: dict[str, Any]) -> tuple[ToolCall, ...]:
+        calls: list[ToolCall] = []
+        for index, item in enumerate(message.get("tool_calls") or []):
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function") or {}
+            calls.append(
+                ToolCall(
+                    id=str(item.get("id") or f"call-{index}"),
+                    name=str(function.get("name") or ""),
+                    arguments=str(function.get("arguments") or ""),
+                )
+            )
+        return tuple(calls)
 
     # --- LLMProvider ---
 
@@ -149,8 +200,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self, messages: Sequence[ChatMessage], options: ChatOptions | None = None
     ) -> ChatResult:
         payload = self._build_payload(messages, options, stream=False)
+        timeout = (options or ChatOptions()).timeout_seconds
         try:
-            async with self._client() as client:
+            async with self._client(timeout) as client:
                 response = await client.post(CHAT_COMPLETIONS_PATH, json=payload)
                 if response.status_code >= 400:
                     raise self._map_status_error(response.status_code, response.content)
@@ -170,15 +222,19 @@ class OpenAICompatibleProvider(LLMProvider):
             model_name=data.get("model") or self.model,
             finish_reason=choice.get("finish_reason"),
             usage=self._parse_usage(data.get("usage")),
+            tool_calls=self._parse_message_tool_calls(message),
         )
 
     async def stream_chat(
         self, messages: Sequence[ChatMessage], options: ChatOptions | None = None
     ) -> AsyncIterator[StreamEvent]:
         payload = self._build_payload(messages, options, stream=True)
+        timeout = (options or ChatOptions()).timeout_seconds
         finish_reason: str | None = None
+        # tool_calls 在流里是分片到达的：按 index 累积 id/name/arguments。
+        pending: dict[int, dict[str, str]] = {}
         try:
-            async with self._client() as client:
+            async with self._client(timeout) as client:
                 async with client.stream("POST", CHAT_COMPLETIONS_PATH, json=payload) as response:
                     if response.status_code >= 400:
                         body = await response.aread()
@@ -195,7 +251,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         if data == "[DONE]":
                             break
                         try:
-                            text, chunk_finish, usage = self._parse_chunk(data)
+                            text, chunk_finish, usage, tool_deltas = self._parse_chunk(data)
                         except json.JSONDecodeError:
                             logger.warning("跳过无法解析的 SSE 数据行：%s", data[:200])
                             continue
@@ -204,6 +260,8 @@ class OpenAICompatibleProvider(LLMProvider):
                             yield StreamEvent.usage_event(usage)
                         if text:
                             yield StreamEvent.token(text)
+                        for delta_call in tool_deltas:
+                            self._accumulate_tool_delta(pending, delta_call)
                         if chunk_finish:
                             # 记下但**不要立刻 return**：OpenAI 会在带 finish_reason
                             # 的 chunk 之后**再**发一个 choices 为空、只带 usage 的
@@ -216,8 +274,37 @@ class OpenAICompatibleProvider(LLMProvider):
         except httpx.RequestError as exc:
             raise LLMUpstreamError("无法连接模型服务") from exc
 
+        # 工具调用分片在流结束后才完整，按 index 顺序一次性交给调用方。
+        for index in sorted(pending):
+            slot = pending[index]
+            yield StreamEvent.tool_call_event(
+                ToolCall(
+                    id=slot.get("id") or f"call-{index}",
+                    name=slot.get("name") or "",
+                    arguments=slot.get("arguments") or "",
+                )
+            )
+
         # 上游没给 finish_reason 就结束了（直接断流），按 stop 处理。
         yield StreamEvent.done(finish_reason or "stop")
+
+    @staticmethod
+    def _accumulate_tool_delta(pending: dict[int, dict[str, str]], delta: Any) -> None:
+        if not isinstance(delta, dict):
+            return
+        try:
+            index = int(delta.get("index") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        slot = pending.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        if delta.get("id"):
+            slot["id"] = str(delta["id"])
+        function = delta.get("function") or {}
+        if function.get("name") and not slot["name"]:
+            # name 通常只在第一片出现；重复覆盖会把名字拼坏。
+            slot["name"] = str(function["name"])
+        if function.get("arguments"):
+            slot["arguments"] += str(function["arguments"])
 
     async def list_models(self) -> list[str]:
         """拉取可用模型名，用于确认 LLM_MODEL 该填什么。"""

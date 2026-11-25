@@ -13,7 +13,7 @@ from app.ai.providers.openai_compat import OpenAICompatibleProvider
 from app.core.config import get_settings
 
 
-@lru_cache
+@lru_cache 
 def get_llm_provider() -> LLMProvider:
     settings = get_settings()
 

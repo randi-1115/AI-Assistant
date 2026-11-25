@@ -375,6 +375,7 @@ class Retriever(Protocol):
         user_id: int,
         query: str,
         attachment_ids: Sequence[int],
+        top_k: int | None = None,
     ) -> list[RetrievedChunk]:
         ...
 
@@ -390,6 +391,7 @@ class KeywordRetriever:
         user_id: int,
         query: str,
         attachment_ids: Sequence[int],
+        top_k: int | None = None,
     ) -> list[RetrievedChunk]:
         if not attachment_ids:
             return []
@@ -442,18 +444,19 @@ class KeywordRetriever:
                 )
             )
         candidates = dedupe_by_content(candidates)
-        top_k = self.settings.rag_top_k
+        # 工具调用可以显式指定 top_k；默认仍沿用 RAG_TOP_K，老调用方行为不变。
+        limit = max(1, self.settings.rag_top_k if top_k is None else top_k)
         ranked = rank_chunks(
             query,
             candidates,
-            top_k=top_k,
-            per_file_k=max(1, top_k // 2),
+            top_k=limit,
+            per_file_k=max(1, limit // 2),
         )
 
         # 总结类问题通常没有正文关键词，必须回退到文档的代表性片段。
         # 具体问题没命中时保持原有行为，避免把无关片段硬塞进上下文。
         if is_summary_query(query):
-            baseline = select_baseline_chunks(candidates, top_k=top_k)
+            baseline = select_baseline_chunks(candidates, top_k=limit)
             seen = {(chunk.attachment_id, chunk.chunk_index) for chunk in ranked}
             merged = list(ranked)
             for chunk in baseline:
@@ -462,7 +465,7 @@ class KeywordRetriever:
                     continue
                 seen.add(key)
                 merged.append(chunk)
-                if len(merged) >= top_k:
+                if len(merged) >= limit:
                     break
-            ranked = merged[:top_k]
+            ranked = merged[:limit]
         return ranked

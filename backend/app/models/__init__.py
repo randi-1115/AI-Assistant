@@ -8,6 +8,14 @@ from app.models.attachment import Attachment
 from app.models.conversation import Conversation
 from app.models.document_chunk import DocumentChunk
 from app.models.message import Message
+from app.models.tool_run import ToolRun
 from app.models.user import User
 
-__all__ = ["Attachment", "Conversation", "DocumentChunk", "Message", "User"]
+__all__ = [
+    "Attachment",
+    "Conversation",
+    "DocumentChunk",
+    "Message",
+    "ToolRun",
+    "User",
+]

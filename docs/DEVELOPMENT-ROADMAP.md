@@ -10,7 +10,7 @@
 | P0 | 基础主链路 | **已完成** | 会话、消息、SSE、停止/重生成、MySQL、错误/日志 |
 | P1 | 知识底座 | **已完成** | 文件上传/解析/切块/关键词 RAG、Tavily+SerpApi 联网搜索、来源 |
 | P1.5 | 质量硬化 | **已完成（有已知边界）** | 真实文档/搜索评测、正文抽取、查询规划、来源多样性、延迟/成本门槛 |
-| P2 | **Agent 核心** | **下一步** | 工具协议、注册表、function calling、有界循环、tool_run 日志、工具状态 UI |
+| P2 | **Agent 核心** | **已完成（评测通过）** | 工具协议、注册表、function calling、有界循环、tool_run 日志、工具状态 UI |
 | P3 | 记忆与个性化 | 计划 | 长期记忆、设置、创作模式、自定义指令 |
 | P4 | 多模态 | 计划 | 图像理解、语音输入/朗读；不做图像生成/编辑 |
 | P5 | 产品化 | 计划 | 多模型切换、认证/多用户、部署、限流、可观测性、CI |
@@ -97,19 +97,23 @@
 
 **依赖**：P1。
 
-## P2：Agent 核心（下一步，重点）
+## P2：Agent 核心（已完成）
 
 **目标**：从“预检索管线”升级为“模型决定调用工具”的单 Agent 循环。
 
+**进度（2026-11-23）**：7 项功能全部完成；`agent_mode` 默认 `off`，开启后走工具循环，关闭时 P1 行为不变。评测脚本 `scripts/eval_p2.py` + 11 个场景（mock 2 + 真实 9）全部通过，结果见 `docs/P2-EVALUATION.md`，协议见 `docs/AGENT-TOOL-PROTOCOL.md`。
+
 **范围**：
 
-1. `Tool` ABC：name、description、JSON Schema、`run(args, context)`、超时、输出上限。
-2. `ToolRegistry`：白名单、参数校验、统一错误、启停。
-3. 首批工具：`calculator`（安全表达式解析，禁止 `eval`）、`document_search`、`web_search`（复用 P1）。
-4. Provider tool calling：OpenAI 兼容 adapter + mock；模型不支持时结构化输出兜底。
-5. 有界循环：最大步数（`AGENT_MAX_TOOL_CALLS`）、单工具/总超时、取消传播、失败回填。
-6. `tool_runs` 表与日志：参数摘要、结果摘要、状态、耗时、错误；SSE `tool_status`。
-7. 前端工具状态 UI；来源与最终回答持久化。
+1. `Tool` ABC：name、description、JSON Schema、`run(args, context)`、超时、输出上限。**已完成**
+2. `ToolRegistry`：白名单、参数校验、统一错误、启停。**已完成**
+3. 首批工具：`calculator`（安全表达式解析，禁止 `eval`）、`document_search`、`web_search`（复用 P1）。**已完成**
+4. Provider tool calling：OpenAI 兼容 adapter + mock；模型不支持时结构化输出兜底。**已完成**
+5. 有界循环：最大步数（`AGENT_MAX_TOOL_CALLS`）、单工具/总超时、取消传播、失败回填。**已完成**
+6. `tool_runs` 表与日志：参数摘要、结果摘要、状态、耗时、错误；SSE `tool_status`。**已完成**
+7. 前端工具状态 UI；来源与最终回答持久化。**已完成**
+
+**已知边界**：工具消息不写入 `messages` 表，后续轮次不重放工具上下文；`AGENT_MAX_TOOL_CALLS` 是总执行次数，不是"步数"；mock 工具调用依赖显式标记。
 
 **不做**：任意 Shell/代码执行、任意本地路径、无人值守长任务、多 Agent。
 
@@ -119,11 +123,11 @@
 - 算数、查文件、查网页、组合任务各至少 2 个真实场景通过。
 - 超过步数/超时/工具异常能安全结束并说明原因。
 - `tool_runs` 可追溯；前端能看到工具执行状态。
-- 至少 10 个评测场景：该用工具的、不该用的、多步的、失败的。
+- 11 个评测场景：该用工具的、不该用的、多步的、失败的；mock 2/2、真实 9/9 通过。
 
 **学习点**：Function/Tool Calling、JSON Schema、Agent 控制循环、白名单/最小权限、超时/重试、可观测性、失败恢复。
 
-**作品产出**：多工具 demo、工具协议文档、`tool_runs` 日志截图、Agent 评测报告。
+**作品产出**：多工具 demo、工具协议文档（`docs/AGENT-TOOL-PROTOCOL.md`）、`tool_runs` 日志截图、Agent 评测报告（`docs/P2-EVALUATION.md`）。
 
 **依赖**：P1/P1.5；模型 tool calling 真实验证。
 

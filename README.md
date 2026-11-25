@@ -11,14 +11,14 @@
 | P0 | 会话、多轮聊天、SSE、停止/重生成、Markdown、MySQL、错误/日志 | **已完成** |
 | P1 | 文件上传/解析/切块/关键词 RAG、Tavily+SerpApi 联网搜索、来源与降级 | **已完成** |
 | P1.5 | 真实文档/搜索评测、正文抽取、查询规划、来源多样性、延迟/成本门槛 | **已完成（有已知边界）** |
-| P2 | Agent 核心：工具协议、function calling、有界循环、tool_run 日志、工具状态 UI | **下一步** |
+| P2 | Agent 核心：工具协议、function calling、有界循环、tool_run 日志、工具状态 UI | **已完成（评测通过）** |
 | P3 | 长期记忆、设置、创作模式、自定义指令 | 计划 |
 | P4 | 图像理解、语音输入/朗读（不做图像生成） | 计划 |
 | P5 | 多模型切换、认证/多用户、部署、限流、可观测性、CI | 计划 |
 | P6 | MCP/插件、工作模式、可选多 Agent | 计划 |
 | P7 | 视频、图像生成/编辑、训练/微调、社交/支付 | 暂缓 |
 
-> P1 的文件问答与联网搜索已在当前工作区实现；P2 的 `tools/`、`agent_service.py` 仍是占位。
+> P2 已完成：工具协议、注册表、provider tool calling、有界循环、`tool_runs`、前端工具状态与"工具模式"开关均已实现；`agent_mode` 默认关闭。11 个场景的评测（mock 2 + 真实 9）全部通过，结果见 `docs/P2-EVALUATION.md`，协议见 `docs/AGENT-TOOL-PROTOCOL.md`。
 
 ## 功能矩阵
 
@@ -31,7 +31,8 @@
 | 联网搜索（Tavily 主源 + SerpApi 可选备源）、来源、时效参数、降级 | 已实现 |
 | 搜索正文抽取、查询规划、来源质量/多样性、缓存/预算 | 已实现（P1.5） |
 | 文件标题路径、表格、overlap 预算、IDF/引用校验 | 已实现（P1.5） |
-| Agent 工具调用、工具日志、有界循环 | 下一步（P2） |
+| 工具协议/注册表/calculator/document_search/web_search、只读工具清单 | 已实现（P2.1–P2.3） |
+| Provider tool calling、有界循环、结构化兜底、tool_runs、工具状态 UI、工具模式开关 | 已实现（P2.4–P2.7） |
 | 长期记忆、创作模式、设置页 | 计划（P3） |
 | 图像理解、语音输入/朗读 | 计划（P4） |
 | 多模型切换、认证/多用户、部署 | 计划（P5） |
@@ -171,6 +172,9 @@ SERPAPI_API_KEY=...
 | `SEARCH_CONTEXT_MAX_CHARS` / `SEARCH_SNIPPET_CHARS` | 3000 / 300 | 网页资料预算 / 来源摘要长度 |
 | `RAG_CANDIDATES_PER_FILE` / `RAG_MAX_EXCERPTS_PER_FILE` | 400 / 2 | 每附件候选块 / 多文件时每文件 excerpt 上限 |
 | `CONTEXT_MAX_MESSAGES` / `CONTEXT_MAX_CHARS` | 20 / 8000 | 历史消息条数 / 上下文字符预算 |
+| `TOOLS_ENABLED` | `calculator,document_search,web_search` | 工具白名单；留空禁用全部工具 |
+| `TOOL_TIMEOUT_SECONDS` / `TOOL_MAX_OUTPUT_CHARS` | 15 / 8000 | 单工具超时 / 输出上限；超时必须大于 `SEARCH_TOTAL_TIMEOUT_SECONDS` |
+| `AGENT_MAX_TOOL_CALLS` / `AGENT_TOTAL_TIMEOUT_SECONDS` | 3 / 90 | 单轮工具执行次数上限 / 整轮时间预算 |
 | `MOCK_FORCE_ERROR` | 空 | 强制 mock 报错：`upstream`/`timeout`/`rate_limit`/`auth` |
 
 完整列表见 `backend/.env.example`。
@@ -206,6 +210,12 @@ python scripts/eval_p15.py --mode search --real
 
 # 完整真实 E2E（真实 LLM + 搜索 + 文件；会消耗额度）
 python scripts/eval_p15.py --mode e2e --real --max-cases 3
+
+# P2 Agent 工具评测：机制（mock，无外呼）
+python scripts/eval_p2.py --mode mock
+
+# P2 Agent 工具评测：真实模型 + 真实搜索（会消耗额度）
+python scripts/eval_p2.py --mode real
 ```
 
 评测用例在 `backend/tests/fixtures/eval/`，生成文档在 `tests/fixtures/documents.py`；脚本默认清理 E2E 会话。
@@ -224,12 +234,12 @@ ai-assistant-v1/
 │       ├── models/        # SQLAlchemy ORM
 │       ├── repositories/  # SQL 查询（强制按 user_id 过滤）
 │       ├── schemas/       # Pydantic 请求/响应契约
-│       ├── services/      # 聊天、会话、文件、搜索；agent_service 待实现
+│       ├── services/      # 聊天入口、agent 循环、会话、文件、搜索
 │       ├── ai/providers/  # LLM 抽象、mock、OpenAI 兼容 adapter
 │       ├── rag/           # 解析、切块、关键词检索、RAG 提示词（已实现）
 │       ├── search/        # Tavily/SerpApi、主备切换、搜索提示词（已实现）
 │       ├── storage/       # 私有存储抽象与本地实现（已实现）
-│       └── tools/         # Agent 工具协议/注册表（P2 下一步）
+│       └── tools/         # 工具协议/注册表/calculator/document_search/web_search
 ├── frontend/src/
 │   ├── api/               # 请求封装、SSE 解析
 │   ├── components/        # 布局、聊天、上传、来源、工具状态
@@ -248,7 +258,7 @@ ai-assistant-v1/
 2. **文件细节**：针对具体段落/数字提问 → 召回对应片段，资料不足时明确说明。
 3. **时效新闻**：打开联网搜索 → 问“最近一周 AI 圈有什么新闻” → 先显示联网状态，再出现带日期的可点击来源。
 4. **失败降级**：不配置/填错搜索 key → 明确提示“联网搜索不可用”，聊天继续，不伪造来源。
-5. **Agent 工具（P2）**：算数 + 查文件/网页的组合任务 → 工具状态、步数、`tool_runs` 日志。
+5. **Agent 工具（P2）**：打开"工具模式" → 算数、查文件、查网页或组合任务 → 工具状态条（参数/耗时/失败原因）、`tool_runs` 日志；mock 下用 `__mock_tool__calculator {"expression":"(1+2)*3"}` 触发。
 6. **记忆（P3）**：开启记忆后记住偏好；关闭/删除后不再注入。
 
 ## 已知限制
@@ -256,7 +266,9 @@ ai-assistant-v1/
 - **文件 RAG 是关键词检索**：中文二元组 + 英文/代码词 + IDF/标题路径，同义改写/跨语言召回仍有限；扫描版 PDF/图片不 OCR。
 - **搜索正文依赖 Tavily raw content**：SerpApi 备源仍只有摘要；宽泛新闻可能只返回单一媒体，模型必须明确说明来源不足；没有自建页面抓取器/SSRF 面。
 - **图片上传暂不支持**（415）；图像理解与语音在 P4。
-- **长期记忆、创作模式、Agent 工具仍在计划中（P2/P3）**：`mode` 字段目前只校验、不改变行为；`tools/` 是 P2 占位。
+- **工具模式默认关闭**：关闭时仍是 P1 预检索；开启后才有工具循环。工具结果不写入 `messages` 表，后续轮次不重放工具上下文，只能通过最终回答与 `tool_runs` 追溯。
+- **P2 已评测**：11 个场景（mock 2 + 真实 9）全部通过，详见 `docs/P2-EVALUATION.md`；真实评测非确定性，web 用例在搜索降级时允许 skip 并记录原因。搜索慢时模型可能重试，单轮 web 对话可能需要 30–40s。
+- **长期记忆、创作模式仍在计划中（P3）**：`mode` 字段目前只校验、不改变行为。
 - **旧上传不会自动重索引**：解析/切块改进只影响新上传；旧文件需重新上传（或后续用重解析脚本）。
 - **没有登录认证**：固定本地开发用户，所有查询按 `user_id` 过滤，但不等同于多用户安全隔离；公开部署前必须补认证、限流、HTTPS。
 - **前端限制**：只加载最近 100 条消息/50 个会话，没有分页加载控件；缺组件/E2E 测试与 CI。
@@ -280,4 +292,4 @@ ai-assistant-v1/
 - `docs/API-SPEC.md` —— 接口契约（含 SSE 事件格式）
 - `docs/DB-SCHEMA.md` —— 数据库表结构
 
-> 说明：`API-SPEC.md` / `DB-SCHEMA.md` 中仍有部分“计划中”的记忆/设置/工具接口与表结构，尚未挂载或迁移；状态标记将在后续独立任务中同步。
+> 说明：`API-SPEC.md` / `DB-SCHEMA.md` 中仍有部分“计划中”的记忆/设置接口与表结构，尚未挂载或迁移；状态标记将在后续独立任务中同步。

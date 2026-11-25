@@ -40,7 +40,7 @@ def test_capabilities():
     assert instance.supports(Capability.TEXT_CHAT)
     assert instance.supports(Capability.STREAMING)
     assert not instance.supports(Capability.VISION)
-    assert not instance.supports(Capability.TOOL_CALLING)
+    assert instance.supports(Capability.TOOL_CALLING)
 
 
 async def test_chat_returns_template_with_message_count():

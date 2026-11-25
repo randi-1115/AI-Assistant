@@ -5,6 +5,7 @@ export interface Capabilities {
   streaming: boolean
   vision: boolean
   tool_calling: boolean
+  agent_mode: boolean
   web_search: boolean
   document_qa: boolean
   memory: boolean

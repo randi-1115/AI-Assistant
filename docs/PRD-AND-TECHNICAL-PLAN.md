@@ -42,7 +42,7 @@
 | 联网搜索（Tavily 主源 + SerpApi 可选备源）、来源、失败降级、时效参数 | 已实现 | P1 |
 | 搜索正文抽取、查询规划/子查询、来源质量与多样性、缓存/预算 | 已实现 | P1.5 |
 | 文件标题路径/表格/overlap 预算/IDF/引用校验 | 已实现 | P1.5 |
-| 工具协议、注册表、function calling、有界循环、tool_run 日志、工具状态 UI | 下一步 | P2 |
+| 工具协议、注册表、function calling、有界循环、tool_run 日志、工具状态 UI | 已实现 | P2 |
 | 长期记忆（默认关闭）、设置页、创作模式、自定义指令 | 计划 | P3 |
 | 图像理解、语音输入（ASR）、语音朗读（TTS） | 计划 | P4 |
 | 多模型切换、认证/多用户、部署、限流、可观测性、CI | 计划 | P5 |
@@ -93,11 +93,11 @@
 - `services/`：聊天、会话、文件、搜索、记忆、Agent 编排。
 - `repositories/`：SQL 查询；所有业务查询强制带 `user_id`。
 - `models/`：SQLAlchemy ORM。
-- `ai/providers/`：`LLMProvider` 抽象、mock、OpenAI 兼容 adapter；未来加视觉/工具调用能力。
+- `ai/providers/`：`LLMProvider` 抽象、mock、OpenAI 兼容 adapter；已支持工具调用，视觉能力后续扩展。
 - `rag/`：解析器、分块、检索、RAG 提示词组装。
 - `search/`：Tavily/SerpApi adapter、主备切换、去重、时效与提示词组装。
 - `storage/`：`StorageBackend` 抽象与本地实现。
-- `tools/`：工具 ABC、注册表、计算器、文档检索、搜索工具（P2）。
+- `tools/`：工具 ABC、注册表、计算器、文档检索、搜索工具（P2 已实现）。
 - `core/`：配置、日志、错误、请求上下文。
 
 ### 4.3 前端结构
@@ -159,7 +159,7 @@
 3. 支持查看、修改、删除、关闭；关闭后停止新增/注入；删除后不再召回。
 4. 上下文按相关性与预算注入有限条记忆。
 
-### 5.5 Agent 工具循环（P2 目标态）
+### 5.5 Agent 工具循环（P2 已实现）
 
 1. 模型根据工具 schema 返回 tool call。
 2. 注册表校验工具名、参数、权限、超时；执行并截断输出。
@@ -177,6 +177,38 @@
 - `ToolRegistry`：白名单、按需启用、参数校验、统一错误、结果归一化。
 - 首批工具：`calculator`（安全表达式解析，禁止 `eval`）、`document_search`、`web_search`。
 
+**实现状态（P2.1–P2.3，2026-11-19）**
+
+- `app/tools/base.py`：`Tool` / `ToolArgs`（Pydantic，`extra="forbid"`）/ `ToolContext` / `ToolResult` / `ToolError`。
+- `app/tools/registry.py`：白名单 + 运行时 enable/disable、参数校验、超时、输出截断、异常归一化；
+  `ToolExecution` 提供 `sse_status` 与 `tool_run_status` 映射（见下表）。
+- `app/tools/calculator.py`：AST 白名单求值，节点数/深度/指数/结果大小有上限，源码不使用 `eval`/`exec`。
+- `app/tools/document_search.py`：只检索本轮 `ToolContext.attachment_ids`；`file_ids` 只能收窄范围；
+  复用 `KeywordRetriever` / `build_excerpts` / `build_rag_block` / `build_source_payloads`。
+- `app/tools/web_search.py`：复用 `SearchService` 与 `<web_results>` 不可信内容边界；
+  未配置搜索源时不暴露给模型。
+- `GET /api/v1/tools`：只读清单（name/description/parameters/available），不执行工具。
+- 状态映射：
+
+  | ToolExecution.status | SSE `tool_status` | `tool_runs.status` |
+  |---|---|---|
+  | success | done | success |
+  | empty | empty | success |
+  | unavailable | unavailable | failed |
+  | failed | failed | failed |
+  | timeout | failed | timeout |
+
+**实现状态（P2.4–P2.7，2026-11-21）**
+
+- Provider：`ChatMessage`/`ChatOptions`/`ChatResult`/`StreamEvent` 支持 tool calls；OpenAI 兼容 adapter 按 index 累积流式 `delta.tool_calls` 并一次性发出；`ChatOptions.timeout_seconds` 现在真实生效。mock 用 `__mock_tool__<name> <json>` 标记模拟工具调用，按已回填的 tool 消息数确定性推进多步。
+- `app/services/agent_service.py`：工具模式的有界循环。每轮最多 `AGENT_MAX_TOOL_CALLS` 次执行、`AGENT_TOTAL_TIMEOUT_SECONDS` 总预算；模型一次请求多个工具时逐个执行，并保证每个 `tool_call.id` 都有对应的 tool 消息；预算耗尽时做一次无工具收口调用。
+- 结构化兜底：provider 不支持 `TOOL_CALLING` 时注入 JSON 协议（`{"action":"tool",...}` / `{"action":"final",...}`），用非流式 `chat` 解析执行；工具结果用带边界的 user 消息回填。
+- 来源：同轮多次文档检索会去重并全局重编号 `[资料 N]`，重复来源不重复发 `source`。
+- `chat_service.py`：`agent_mode=off` 保持 P1 路径；`auto` 时跳过预检索，把附件 id 交给工具；两条路径共用 `TurnState` 与 `_finalize_safely`。
+- `tool_runs`：迁移 `c1d2e3f4a5b6`；只写终态，记录参数摘要、结果摘要、状态、耗时、错误码。
+- 前端：`agent_mode` 请求字段与"工具模式"开关；`ToolStatus.vue` 支持多工具名、参数摘要、耗时、失败/超时；持久化终态从 `metadata_json.tool_statuses` 恢复。
+- 评测与测试：`scripts/eval_p2.py` + `tests/fixtures/eval/p2_cases.jsonl`（11 场景），真实结果见 `docs/P2-EVALUATION.md`；协议细节见 `docs/AGENT-TOOL-PROTOCOL.md`。
+
 ### 6.2 Agent 循环与边界
 
 - 单 Agent、有界循环：模型 → tool call → 执行 → tool 结果 → 继续/结束。
@@ -187,7 +219,7 @@
 ### 6.3 工具运行记录与可观测性
 
 - `tool_runs`：会话/消息、工具名、参数摘要、结果摘要、状态、耗时、错误。
-- SSE `tool_status`：running/done/failed，前端展示执行状态。
+- SSE `tool_status`：running/done/empty/unavailable/failed（超时为 failed + `error_code=timeout`），前端展示执行状态。
 - 请求 ID、工具日志、来源、用量一起构成可追溯链路。
 
 ### 6.4 记忆与上下文
@@ -248,7 +280,7 @@
 - 文件 RAG 是关键词检索（中文二元组 + IDF + 标题路径），同义改写/跨语言召回仍有限；扫描件/图片不 OCR。
 - 联网搜索正文依赖 Tavily `raw_content`；SerpApi 备源仍只有摘要；宽泛新闻可能只返回单一媒体，模型需明确说明来源不足；没有自建页面抓取器（避免 SSRF）。
 - 旧上传不会自动重索引，解析/切块改进只影响新上传。
-- 图片理解、语音、长期记忆、Agent 工具仍在计划中（P2–P4）。
+- 图片理解、语音、长期记忆仍在计划中（P3–P4）；Agent 工具已完成 P2。
 - 前端缺分页加载、组件/E2E 测试；无 CI。
 
 ## 8. 非功能要求

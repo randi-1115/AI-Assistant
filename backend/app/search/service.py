@@ -96,18 +96,32 @@ class FallbackSearchProvider(SearchProvider):
         errors: list[str] = []
         any_success = False
 
-        for provider in (self.primary, self.fallback):
-            if not provider.configured:
+        providers = [
+            provider for provider in (self.primary, self.fallback) if provider.configured
+        ]
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        for provider in providers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append(f"{provider.name}: 时间预算已用尽")
                 continue
+            # 主源用满单次预算：Tavily 正常延迟 2–6s，拆预算会把主源提前掐断。
+            # 备源只在主源快速失败（鉴权/限流/空结果）时接管；主源拖到超时
+            # 说明上游确实慢，继续等备源也只会把整轮搜索拖过预算。
+            budget = min(timeout_seconds, remaining)
             try:
-                results = await provider.search(
-                    query,
-                    max_results=max_results,
-                    timeout_seconds=timeout_seconds,
-                    time_range=time_range,
-                    topic=topic,
+                results = await asyncio.wait_for(
+                    provider.search(
+                        query,
+                        max_results=max_results,
+                        timeout_seconds=budget,
+                        time_range=time_range,
+                        topic=topic,
+                    ),
+                    timeout=budget,
                 )
-            except SearchError as exc:
+            except (SearchError, asyncio.TimeoutError) as exc:
                 errors.append(f"{provider.name}: {exc}")
                 continue
             any_success = True
@@ -244,7 +258,7 @@ class SearchService:
     ) -> list[SearchResult]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise SearchTimeoutError("联网搜索超时")
+            raise SearchTimeoutError("联网搜索超时，已超过本轮搜索时间预算")
         timeout = min(self.settings.search_timeout_seconds, remaining)
         try:
             return await asyncio.wait_for(
@@ -258,7 +272,7 @@ class SearchService:
                 timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
-            raise SearchTimeoutError("联网搜索超时") from exc
+            raise SearchTimeoutError("联网搜索超时，已超过本轮搜索时间预算") from exc
 
     async def _fetch_plan(
         self,
@@ -306,6 +320,9 @@ class SearchService:
 
     async def search(self, query: str, *, mode: str) -> SearchOutcome:
         started = time.monotonic()
+        # 总预算从进入 search 就开始计时：LLM 查询规划也算在内，否则
+        # 规划 2–3s + 搜索 12s 会顶到工具超时上限，表现成“联网搜索超时”。
+        deadline = started + self.settings.search_total_timeout_seconds
         if mode != "auto":
             return SearchOutcome(status="disabled")
 
@@ -344,7 +361,14 @@ class SearchService:
                 cached=True,
             )
 
-        deadline = started + self.settings.search_total_timeout_seconds
+        if time.monotonic() >= deadline:
+            return SearchOutcome(
+                status="unavailable",
+                message="联网搜索超时，已超过本轮搜索时间预算",
+                intent=plan.intent,
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+
         try:
             raw_results, calls = await self._fetch_plan(provider, plan, deadline)
         except SearchError as exc:

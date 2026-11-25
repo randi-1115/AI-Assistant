@@ -39,7 +39,14 @@ async def _prepare_schema() -> AsyncIterator[None]:
 async def _clean_tables() -> AsyncIterator[None]:
     """每个用例前清空数据，保证互不影响。"""
     async with SessionLocal() as session:
-        for table in ("document_chunks", "attachments", "messages", "conversations", "users"):
+        for table in (
+            "tool_runs",
+            "document_chunks",
+            "attachments",
+            "messages",
+            "conversations",
+            "users",
+        ):
             await session.execute(text(f"DELETE FROM {table}"))
         await session.commit()
     yield

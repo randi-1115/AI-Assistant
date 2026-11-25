@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -18,6 +19,8 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 SUPPORTED_LLM_PROVIDERS = ("mock", "deepseek")
 # 联网搜索只接两家：Tavily 为主，SerpApi 可选作为备源。
 SUPPORTED_SEARCH_PROVIDERS = ("none", "tavily", "serpapi")
+# 工具名只允许小写字母/数字/下划线，避免空格、路径和注入字符进入白名单。
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class Settings(BaseSettings):
@@ -109,7 +112,6 @@ class Settings(BaseSettings):
     upload_dir: str = "../data/uploads"
     max_upload_mb: int = 20 # 最大上传文件大小，单位 MB
     rag_top_k: int = 4 # RAG 模型返回的 top-k 个文档
-    agent_max_tool_calls: int = 3 # 智能体最大调用工具次数
 
     # --- 文档解析与切块（阶段 P1：文件上传 + 轻量 RAG）---
     rag_chunk_size_chars: int = 800 # 单个文本块的目标长度（字符）
@@ -124,9 +126,28 @@ class Settings(BaseSettings):
     rag_citation_validation: bool = True # 记录回答里的 [资料 N] 是否有效
     rag_synonym_expansion: bool = False # 同义词扩展默认关闭
 
+    # --- P2 工具协议（白名单、单工具超时、输出上限）---
+    # 逗号分隔的工具白名单；留空表示禁用全部工具。
+    # 名称格式在这里只做语法校验，是否真的注册由 tools 层决定。
+    tools_enabled: str = "calculator,document_search,web_search"
+    # 单轮 agent 循环最多执行多少次工具调用。
+    agent_max_tool_calls: int = 3
+    # 单轮 agent 循环的总时间预算，必须给多步调用留出空间。
+    agent_total_timeout_seconds: float = 90.0
+    # 默认单工具超时必须大于 SEARCH_TOTAL_TIMEOUT_SECONDS，否则联网搜索会被提前掐断。
+    tool_timeout_seconds: float = 15.0
+    # 工具结果回填模型前的硬上限；单个工具可以设得更小。
+    tool_max_output_chars: int = 8000
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def tools_enabled_names(self) -> frozenset[str]:
+        return frozenset(
+            item.strip().lower() for item in self.tools_enabled.split(",") if item.strip()
+        )
 
     @model_validator(mode="after") # 检查 LLM 配置是否合法
     def _check_llm_config(self) -> "Settings":
@@ -206,6 +227,38 @@ class Settings(BaseSettings):
             raise ValueError("SEARCH_PLANNER_TIMEOUT_SECONDS 必须在 (0, 10] 内")
         if not 64 <= self.search_planner_max_tokens <= 1024:
             raise ValueError("SEARCH_PLANNER_MAX_TOKENS 必须在 [64, 1024] 内")
+        return self
+
+    @model_validator(mode="after")  # 检查 P2 工具白名单与上限是否合法
+    def _check_tool_config(self) -> "Settings":
+        if not 0 < self.tool_timeout_seconds <= 60:
+            raise ValueError("TOOL_TIMEOUT_SECONDS 必须在 (0, 60] 内")
+        if not 256 <= self.tool_max_output_chars <= 50_000:
+            raise ValueError("TOOL_MAX_OUTPUT_CHARS 必须在 [256, 50000] 内")
+        for name in self.tools_enabled_names:
+            if not _TOOL_NAME.match(name):
+                raise ValueError(f"TOOLS_ENABLED 中的工具名非法：{name!r}")
+        if (
+            "web_search" in self.tools_enabled_names
+            and self.tool_timeout_seconds <= self.search_total_timeout_seconds
+        ):
+            raise ValueError(
+                "TOOL_TIMEOUT_SECONDS 必须大于 SEARCH_TOTAL_TIMEOUT_SECONDS，"
+                "否则联网搜索会被工具超时提前掐断"
+            )
+        return self
+
+    @model_validator(mode="after")  # 检查 agent 循环边界
+    def _check_agent_config(self) -> "Settings":
+        if not 1 <= self.agent_max_tool_calls <= 10:
+            raise ValueError("AGENT_MAX_TOOL_CALLS 必须在 [1, 10] 内")
+        if not 0 < self.agent_total_timeout_seconds <= 300:
+            raise ValueError("AGENT_TOTAL_TIMEOUT_SECONDS 必须在 (0, 300] 内")
+        if self.agent_total_timeout_seconds < self.tool_timeout_seconds:
+            raise ValueError(
+                "AGENT_TOTAL_TIMEOUT_SECONDS 不能小于 TOOL_TIMEOUT_SECONDS，"
+                "否则工具还没跑完总预算就耗尽"
+            )
         return self
 
 

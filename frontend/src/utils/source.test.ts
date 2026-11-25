@@ -158,6 +158,35 @@ describe('toolStatusesFromMetadata', () => {
     ])
   })
 
+  it('解析 failed 与 P2 新字段', () => {
+    expect(
+      toolStatusesFromMetadata({
+        tool_statuses: [
+          {
+            tool: 'calculator',
+            status: 'failed',
+            message: '工具执行失败：除数不能为 0',
+            call_id: 'call_1',
+            arguments_summary: 'expression="1/0"',
+            duration_ms: 3,
+            error_code: 'invalid_expression',
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        tool: 'calculator',
+        status: 'failed',
+        message: '工具执行失败：除数不能为 0',
+        provider: null,
+        call_id: 'call_1',
+        arguments_summary: 'expression="1/0"',
+        duration_ms: 3,
+        error_code: 'invalid_expression',
+      },
+    ])
+  })
+
   it('丢弃未知状态和坏数据', () => {
     expect(
       toolStatusesFromMetadata({

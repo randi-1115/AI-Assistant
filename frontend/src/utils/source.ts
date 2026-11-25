@@ -20,6 +20,7 @@ const TOOL_STATUSES: ReadonlySet<string> = new Set([
   'done',
   'empty',
   'unavailable',
+  'failed',
 ])
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,12 +108,22 @@ export function toolStatusesFromMetadata(
     const tool = asString(item.tool)
     const status = asString(item.status)
     if (!tool || !status || !TOOL_STATUSES.has(status)) continue
-    statuses.push({
+    const parsed: ToolStatusPayload = {
       tool,
       status: status as ToolStatus,
       message: asString(item.message),
       provider: asString(item.provider),
-    })
+    }
+    // 新字段只在存在时写入，保持旧 metadata 的解析结果形状不变。
+    const callId = asString(item.call_id)
+    if (callId) parsed.call_id = callId
+    const summary = asString(item.arguments_summary)
+    if (summary) parsed.arguments_summary = summary
+    const duration = asNumber(item.duration_ms)
+    if (duration !== null) parsed.duration_ms = duration
+    const errorCode = asString(item.error_code)
+    if (errorCode) parsed.error_code = errorCode
+    statuses.push(parsed)
   }
   return statuses
 }

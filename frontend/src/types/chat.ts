@@ -11,11 +11,15 @@ export type ChatMode =
 
 export type SearchMode = 'auto' | 'off'
 
+/** 工具模式：off 保持 P1 预检索；auto 由模型决定调用哪些工具。 */
+export type AgentMode = 'auto' | 'off'
+
 export interface ChatStreamRequest {
   content: string
   attachment_ids?: number[]
   mode?: ChatMode
   search_mode?: SearchMode
+  agent_mode?: AgentMode
 }
 
 export interface ChatUsage {
@@ -69,7 +73,7 @@ export interface FileSourcePayload extends SourceBase {
   citation_label?: string | null
 }
 
-/** 联网搜索来源：阶段 3 使用，阶段 2 不会收到。 */
+/** 联网搜索来源：P1/P2 共用。 */
 export interface WebSourcePayload extends SourceBase {
   kind: 'web'
   url: string
@@ -80,17 +84,26 @@ export interface WebSourcePayload extends SourceBase {
 
 export type SourcePayload = FileSourcePayload | WebSourcePayload
 
-export type ToolStatus = 'running' | 'done' | 'empty' | 'unavailable'
+/** 终态里的 failed 涵盖参数错误、未知工具、执行异常；超时用 error_code 区分。 */
+export type ToolStatus =
+  | 'running'
+  | 'done'
+  | 'empty'
+  | 'unavailable'
+  | 'failed'
 
 export interface ToolStatusPayload {
   tool: string
   status: ToolStatus
   message?: string | null
   provider?: string | null
+  call_id?: string | null
+  arguments_summary?: string | null
+  duration_ms?: number | null
+  error_code?: string | null
 }
 
-/** 流式回调。P0 只用到 message_start / token / message_end / error；
- *  source 与 tool_status 是给 P1 预留的。 */
+/** 流式回调。source/tool_status 由 P1 检索与 P2 工具执行产生。 */
 export interface SSEHandlers {
   onMessageStart?: (payload: MessageStartPayload) => void
   onToken?: (payload: TokenPayload) => void

@@ -33,6 +33,11 @@ class SearchMode(StrEnum):
     OFF = "off"
 
 
+class AgentMode(StrEnum):
+    AUTO = "auto"
+    OFF = "off"
+
+
 class ChatStreamRequest(BaseModel):
     content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     # 显式附带的文件；只有这些文件参与本轮检索。
@@ -40,6 +45,8 @@ class ChatStreamRequest(BaseModel):
     mode: ChatMode = ChatMode.CHAT
     # 默认关闭：联网搜索会产生外部请求与费用，必须由用户显式开启。
     search_mode: SearchMode = SearchMode.OFF
+    # 默认关闭：关闭时保持 P1 预检索行为；开启后由模型决定调用哪些工具。
+    agent_mode: AgentMode = AgentMode.OFF
 
 
 class UsagePayload(BaseModel):
@@ -99,12 +106,19 @@ SourcePayload = FileSourcePayload | WebSourcePayload
 
 
 class ToolStatusPayload(BaseModel):
-    """工具执行状态。running 只作为流式瞬态事件，不落库。"""
+    """工具执行状态。running 只作为流式瞬态事件，不落库。
 
-    tool: Literal["web_search"] = "web_search"
-    status: Literal["running", "done", "empty", "unavailable"]
+    超时保持 status=failed + error_code=timeout，前端据此显示"执行超时"。
+    """
+
+    tool: str
+    status: Literal["running", "done", "empty", "unavailable", "failed"]
     message: str | None = None
     provider: str | None = None
+    call_id: str | None = None
+    arguments_summary: str | None = None
+    duration_ms: int | None = None
+    error_code: str | None = None
 
 
 def dump_usage(usage: ChatUsage | None) -> dict[str, int | None] | None:

@@ -24,8 +24,8 @@ from typing import Any
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.ai.prompts.system import TITLE_SYSTEM_PROMPT, get_system_prompt
-from app.ai.providers.base import ChatMessage, ChatOptions, ChatUsage, LLMProvider, ROLE_USER
+from app.ai.prompts.system import AGENT_TOOL_PROMPT, TITLE_SYSTEM_PROMPT, get_system_prompt
+from app.ai.providers.base import ChatMessage, ChatOptions, LLMProvider, ROLE_USER
 from app.core.config import Settings, get_settings
 from app.core.errors import (
     AppError,
@@ -66,6 +66,7 @@ from app.search.pipeline import (
     merge_web_context,
 )
 from app.search.service import SearchOutcome, SearchService
+from app.services.agent_service import AgentService, AgentTurnContext, TurnState
 from app.services.context_builder import build_context
 from app.services.file_service import attachment_snapshot
 
@@ -79,6 +80,9 @@ HISTORY_FETCH_LIMIT = 200
 
 MAX_ATTACHMENT_IDS = 10
 
+# 两个执行器（P1 预检索 / P2 工具循环）共用的 SSE 事件形状。
+ChatEvent = tuple[str, dict[str, Any]]
+
 
 @dataclass(slots=True)
 class PreparedTurn:
@@ -90,11 +94,16 @@ class PreparedTurn:
     is_first_turn: bool
     first_user_content: str
     title_is_default: bool
+    # 工具上下文需要，agent 模式下由 AgentService 使用。
+    user_id: int = 0
+    # 本轮附带的文件 id；agent 模式下作为 document_search 的硬边界。
+    attachment_ids: list[int] = field(default_factory=list)
     # 本轮检索到的文件来源，流开始后逐条通过 SSE 发给前端。
     sources: list[dict[str, Any]] = field(default_factory=list)
-    # 重新生成时从用户消息继承的搜索设置与原始问题。
+    # 重新生成时从用户消息继承的设置与原始问题。
     query: str = ""
     search_mode: str = "off"
+    agent_mode: str = "off"
 
 
 def fallback_title(content: str) -> str:
@@ -114,6 +123,45 @@ def clean_generated_title(raw: str) -> str:
     return title[:MAX_TITLE_CHARS]
 
 
+def _normalize_agent_mode(raw: str, settings: Settings) -> str:
+    """没有启用任何工具时，agent 模式没有意义，直接按 off 处理。"""
+    return "auto" if raw == "auto" and settings.tools_enabled_names else "off"
+
+
+def _compose_system_prompt(
+    *,
+    rag_block: str | None,
+    agent_mode: str,
+    attachment_count: int,
+) -> str:
+    system_prompt = get_system_prompt("chat")
+    if rag_block:
+        system_prompt = f"{system_prompt}\n\n{rag_block}"
+    if agent_mode == "auto":
+        system_prompt = f"{system_prompt}\n\n{AGENT_TOOL_PROMPT}"
+        if attachment_count:
+            system_prompt += (
+                f"\n\n本轮消息附带了 {attachment_count} 个文件；"
+                "需要文件内容时请调用 document_search 工具，"
+                "不要凭空假设文件内容。"
+            )
+    return system_prompt
+
+
+def _context_budget(
+    settings: Settings,
+    system_prompt: str,
+    *,
+    search_mode: str,
+    agent_mode: str,
+) -> int:
+    budget = settings.context_max_chars - len(system_prompt)
+    # agent 模式不预检索网页，工具结果在循环中产生，不需要预留搜索预算。
+    if search_mode == "auto" and agent_mode != "auto":
+        budget -= settings.search_context_max_chars
+    return max(0, budget)
+
+
 class ChatService:
     def __init__(
         self,
@@ -126,6 +174,13 @@ class ChatService:
         self.session_factory = session_factory
         self._options_factory = options_factory or self._default_options
         self.search_service = search_service or SearchService(get_settings())
+        self.agent_service = AgentService(
+            provider,
+            self.search_service,
+            get_settings(),
+            session_factory=session_factory,
+            options_factory=self._options_factory,
+        )
 
     @staticmethod
     def _default_options() -> ChatOptions:
@@ -148,12 +203,15 @@ class ChatService:
         query: str,
         attachment_ids: list[int] | None,
         strict: bool,
+        retrieve: bool = True,
     ) -> tuple[list[Attachment], list[dict[str, Any]], str | None]:
         """校验附件、检索片段、组装提示词块。
 
         strict=True（新消息）：不存在/别人的/跨会话的附件直接 404。
         strict=False（重新生成）：跳过已删除或已解绑的附件，不让历史附件
         阻止重新生成。
+        retrieve=False（agent 模式）：仍然校验/绑定附件，但跳过检索——
+        文件内容改由 document_search 工具按需检索。
         """
         deduped: list[int] = []
         seen: set[int] = set()
@@ -198,6 +256,9 @@ class ChatService:
                 if attachment.id in unclaimed:
                     attachment.conversation_id = conversation_id
 
+        if not retrieve:
+            return scoped, [], None
+
         ready_ids = [
             attachment.id for attachment in scoped if attachment.parse_status == PARSE_READY
         ]
@@ -233,9 +294,11 @@ class ChatService:
         content: str,
         attachment_ids: list[int] | None = None,
         search_mode: str = "off",
+        agent_mode: str = "off",
     ) -> PreparedTurn:
         settings = get_settings()
         search_mode = "auto" if search_mode == "auto" else "off"
+        agent_mode = _normalize_agent_mode(agent_mode, settings)
         async with self.session_factory() as session:
             conversations = ConversationRepository(session)
             conversation = await conversations.get_owned(conversation_id, user_id)
@@ -243,6 +306,7 @@ class ChatService:
                 raise ConversationNotFound()
 
             # 先检索，再写消息：检索失败不会留下孤儿消息。
+            # agent 模式下文件内容交给 document_search 工具按需检索。
             attachments, sources, rag_block = await self._prepare_rag(
                 session=session,
                 settings=settings,
@@ -251,6 +315,7 @@ class ChatService:
                 query=content,
                 attachment_ids=attachment_ids,
                 strict=True,
+                retrieve=agent_mode != "auto",
             )
 
             messages = MessageRepository(session)
@@ -259,7 +324,10 @@ class ChatService:
             is_first_turn = not existing
             title_is_default = conversation.title == DEFAULT_CONVERSATION_TITLE
 
-            user_metadata: dict[str, Any] = {"search_mode": search_mode}
+            user_metadata: dict[str, Any] = {
+                "search_mode": search_mode,
+                "agent_mode": agent_mode,
+            }
             if attachments:
                 user_metadata["attachments"] = [
                     attachment_snapshot(item) for item in attachments
@@ -279,18 +347,21 @@ class ChatService:
             history = await messages.list_recent(conversation_id, limit=HISTORY_FETCH_LIMIT)
             await session.commit()
 
-        system_prompt = get_system_prompt("chat")
-        if rag_block:
-            system_prompt = f"{system_prompt}\n\n{rag_block}"
-        # 系统提示词本身也占预算；联网搜索模式还要为网页资料预留空间。
-        context_budget = settings.context_max_chars - len(system_prompt)
-        if search_mode == "auto":
-            context_budget -= settings.search_context_max_chars
+        system_prompt = _compose_system_prompt(
+            rag_block=rag_block,
+            agent_mode=agent_mode,
+            attachment_count=len(attachments),
+        )
         provider_messages = build_context(
             history,
             system_prompt=system_prompt,
             max_messages=settings.context_max_messages,
-            max_chars=max(0, context_budget),
+            max_chars=_context_budget(
+                settings,
+                system_prompt,
+                search_mode=search_mode,
+                agent_mode=agent_mode,
+            ),
         )
         return PreparedTurn(
             conversation_id=conversation_id,
@@ -300,9 +371,12 @@ class ChatService:
             is_first_turn=is_first_turn,
             first_user_content=content,
             title_is_default=title_is_default,
+            user_id=user_id,
+            attachment_ids=[attachment.id for attachment in attachments],
             sources=sources,
             query=content,
             search_mode=search_mode,
+            agent_mode=agent_mode,
         )
 
     async def prepare_regenerate(self, *, conversation_id: int, user_id: int) -> PreparedTurn:
@@ -331,7 +405,9 @@ class ChatService:
             ]
             raw_mode = (last_user.metadata_json or {}).get("search_mode", "off")
             search_mode = "auto" if raw_mode == "auto" else "off"
-            _, sources, rag_block = await self._prepare_rag(
+            raw_agent = (last_user.metadata_json or {}).get("agent_mode", "off")
+            agent_mode = _normalize_agent_mode(raw_agent, settings)
+            scoped, sources, rag_block = await self._prepare_rag(
                 session=session,
                 settings=settings,
                 user_id=user_id,
@@ -339,6 +415,7 @@ class ChatService:
                 query=last_user.content or "",
                 attachment_ids=attachment_ids,
                 strict=False,
+                retrieve=agent_mode != "auto",
             )
 
             # 硬删旧的助手回答：保持 messages.id 单调，也避免多轮重新生成后
@@ -355,17 +432,21 @@ class ChatService:
             )
             await session.commit()
 
-        system_prompt = get_system_prompt("chat")
-        if rag_block:
-            system_prompt = f"{system_prompt}\n\n{rag_block}"
-        context_budget = settings.context_max_chars - len(system_prompt)
-        if search_mode == "auto":
-            context_budget -= settings.search_context_max_chars
+        system_prompt = _compose_system_prompt(
+            rag_block=rag_block,
+            agent_mode=agent_mode,
+            attachment_count=len(scoped),
+        )
         provider_messages = build_context(
             history,
             system_prompt=system_prompt,
             max_messages=settings.context_max_messages,
-            max_chars=max(0, context_budget),
+            max_chars=_context_budget(
+                settings,
+                system_prompt,
+                search_mode=search_mode,
+                agent_mode=agent_mode,
+            ),
         )
         return PreparedTurn(
             conversation_id=conversation_id,
@@ -376,9 +457,12 @@ class ChatService:
             is_first_turn=False,
             first_user_content=last_user.content,
             title_is_default=False,
+            user_id=user_id,
+            attachment_ids=[attachment.id for attachment in scoped],
             sources=sources,
             query=last_user.content or "",
             search_mode=search_mode,
+            agent_mode=agent_mode,
         )
 
     # --- 流式执行 ---
@@ -395,14 +479,10 @@ class ChatService:
 
     async def run_turn(
         self, prepared: PreparedTurn, request: Request
-    ) -> AsyncIterator[tuple[str, dict]]:
+    ) -> AsyncIterator[ChatEvent]:
         settings = get_settings()
-        chunks: list[str] = []
-        usage: ChatUsage | None = None
-        finish_reason: str | None = None
-        status = STATUS_COMPLETE
-        sources = list(prepared.sources)
-        tool_statuses: list[dict[str, Any]] = []
+        state = TurnState()
+        state.seed_sources(prepared.sources)
 
         try:
             yield "message_start", {
@@ -410,196 +490,205 @@ class ChatService:
                 "assistant_message_id": prepared.assistant_message_id,
             }
 
-            if prepared.search_mode == "auto":
-                # 搜索是外部调用，先让前端知道正在做什么。
-                yield "tool_status", {"tool": "web_search", "status": "running"}
+            # 两个模式共用同一个执行契约：只产出 token/tool_status/source，
+            # 状态写进 TurnState；message_start/message_end、引用校验与落库
+            # 都由 run_turn 统一负责。
+            executor = self._run_agent if prepared.agent_mode == "auto" else self._run_p1
+            async for item in executor(state, prepared, request):
+                yield item
 
-            # 文件来源已经准备好，先发；web 来源在搜索成功后追加。
-            for source in sources:
-                yield "source", source
-
-            provider_messages = prepared.provider_messages
-            if prepared.search_mode == "auto":
-                outcome = await self._search(prepared.query)
-                extra_prompt: str | None
-                if outcome.status == "ok":
-                    web_sources = build_web_source_payloads(
-                        outcome.results,
-                        snippet_chars=settings.search_snippet_chars,
+            if state.status == STATUS_COMPLETE:
+                if settings.rag_citation_validation and state.sources:
+                    state.citation_report = validate_citations(
+                        "".join(state.chunks), state.sources
                     )
-                    sources.extend(web_sources)
-                    for payload in web_sources:
-                        yield "source", payload
-                    extra_prompt = build_web_block(
-                        outcome.results,
-                        max_chars=settings.search_context_max_chars,
-                        intent=outcome.intent,
-                    )
-                elif outcome.status == "empty":
-                    extra_prompt = build_web_empty_block(outcome.message)
-                else:
-                    extra_prompt = build_web_unavailable_block(outcome.message)
-
-                terminal = {
-                    "tool": "web_search",
-                    "status": {"ok": "done", "empty": "empty"}.get(
-                        outcome.status, "unavailable"
-                    ),
-                    "message": outcome.message,
-                    "provider": outcome.provider,
-                }
-                tool_statuses.append(terminal)
-                yield "tool_status", terminal
-
-                # 搜索期间用户可能已经点了停止；此时不再调用模型。
-                if await request.is_disconnected():
-                    await self._finalize_safely(
-                        prepared,
-                        "".join(chunks),
-                        STATUS_INTERRUPTED,
-                        usage,
-                        "interrupted",
-                        sources=sources,
-                        tool_statuses=tool_statuses,
-                    )
-                    return
-
-                provider_messages = merge_web_context(
-                    prepared.provider_messages, extra_prompt
-                )
-
-            async for event in self.provider.stream_chat(
-                provider_messages, self._options_factory()
-            ):
-                # 主动检查断开：前端点「停止生成」后，这里是最先能感知到的地方。
-                # 走这条路不抛异常，能干净地收尾。
-                if await request.is_disconnected():
-                    status = STATUS_INTERRUPTED
-                    finish_reason = "interrupted"
-                    break
-
-                if event.type == "token" and event.text:
-                    chunks.append(event.text)
-                    yield "token", {"text": event.text}
-                elif event.type == "usage":
-                    usage = event.usage
-                elif event.type == "done":
-                    finish_reason = event.finish_reason or "stop"
-
-            citation_report = None
-            if settings.rag_citation_validation and sources:
-                citation_report = validate_citations("".join(chunks), sources)
-
-            if status == STATUS_COMPLETE:
-                finish_reason = finish_reason or "stop"
+                state.finish_reason = state.finish_reason or "stop"
                 yield "message_end", {
-                    "finish_reason": finish_reason,
-                    "usage": dump_usage(usage),
+                    "finish_reason": state.finish_reason,
+                    "usage": dump_usage(state.usage),
                 }
 
         except asyncio.CancelledError:
             # 兜底路径：客户端硬断（关标签页）时 Starlette 会取消这个任务。
-            await self._finalize_safely(
-                prepared,
-                "".join(chunks),
-                STATUS_INTERRUPTED,
-                usage,
-                "interrupted",
-                sources=sources,
-                tool_statuses=tool_statuses,
-            )
+            state.status = STATUS_INTERRUPTED
+            state.finish_reason = "interrupted"
+            await self._finalize_safely(prepared, state)
             # 必须重新抛出——吞掉 CancelledError 会破坏 ASGI 的取消语义。
             raise
 
         except (LLMError, AppError) as exc:
-            status = STATUS_FAILED
-            finish_reason = "error"
-            logger.warning("流式回答失败 conversation_id=%s code=%s", prepared.conversation_id, exc.code)
+            state.status = STATUS_FAILED
+            state.finish_reason = "error"
+            logger.warning(
+                "流式回答失败 conversation_id=%s code=%s", prepared.conversation_id, exc.code
+            )
             # 错误信封与普通 JSON 错误保持同一结构，前端只需一套解析逻辑。
             yield "error", {
                 "code": exc.code,
                 "message": exc.message,
                 "request_id": get_request_id(),
             }
-            await self._finalize_safely(
-                prepared,
-                "".join(chunks),
-                STATUS_FAILED,
-                usage,
-                "error",
-                sources=sources,
-                tool_statuses=tool_statuses,
-            )
-            yield "message_end", {"finish_reason": "error", "usage": dump_usage(usage)}
+            await self._finalize_safely(prepared, state)
+            yield "message_end", {
+                "finish_reason": "error",
+                "usage": dump_usage(state.usage),
+            }
             return
 
         except Exception:
-            status = STATUS_FAILED
-            finish_reason = "error"
-            logger.exception("流式回答出现未预期异常 conversation_id=%s", prepared.conversation_id)
+            state.status = STATUS_FAILED
+            state.finish_reason = "error"
+            logger.exception(
+                "流式回答出现未预期异常 conversation_id=%s", prepared.conversation_id
+            )
             yield "error", {
                 "code": "internal_error",
                 "message": "服务器内部错误",
                 "request_id": get_request_id(),
             }
-            await self._finalize_safely(
-                prepared,
-                "".join(chunks),
-                STATUS_FAILED,
-                usage,
-                "error",
-                sources=sources,
-                tool_statuses=tool_statuses,
-            )
-            yield "message_end", {"finish_reason": "error", "usage": dump_usage(usage)}
+            await self._finalize_safely(prepared, state)
+            yield "message_end", {
+                "finish_reason": "error",
+                "usage": dump_usage(state.usage),
+            }
             return
 
-        await self._finalize_safely(
-            prepared,
-            "".join(chunks),
-            status,
-            usage,
-            finish_reason or "stop",
-            sources=sources,
-            tool_statuses=tool_statuses,
-            citation_report=citation_report,
+        await self._finalize_safely(prepared, state)
+
+    async def _run_agent(
+        self, state: TurnState, prepared: PreparedTurn, request: Request
+    ) -> AsyncIterator["ChatEvent"]:
+        """P2 执行器：把本轮交给 AgentService 的工具循环。"""
+        context = AgentTurnContext(
+            conversation_id=prepared.conversation_id,
+            assistant_message_id=prepared.assistant_message_id,
+            user_id=prepared.user_id,
+            attachment_ids=tuple(prepared.attachment_ids),
+            search_mode=prepared.search_mode,
+            request_id=get_request_id(),
         )
+        async for item in self.agent_service.run_turn(
+            state,
+            context,
+            prepared.provider_messages,
+            request,
+            self._options_factory(),
+        ):
+            yield item
+
+    async def _run_p1(
+        self,
+        state: TurnState,
+        prepared: PreparedTurn,
+        request: Request,
+    ) -> AsyncIterator["ChatEvent"]:
+        """P1 预检索执行器：顺序必须与既有契约一致。
+
+        事件顺序：running tool_status → 文件来源 → 网页来源 → 终态 → token。
+        与 _run_agent 一样，不负责 message_start / message_end，也不写库。
+        """
+        settings = get_settings()
+        if prepared.search_mode == "auto":
+            # 搜索是外部调用，先让前端知道正在做什么。
+            yield "tool_status", {"tool": "web_search", "status": "running"}
+
+        # 文件来源已经准备好，先发；web 来源在搜索成功后追加。
+        for source in prepared.sources:
+            yield "source", source
+
+        provider_messages = prepared.provider_messages
+        if prepared.search_mode == "auto":
+            outcome = await self._search(prepared.query)
+            extra_prompt: str | None
+            if outcome.status == "ok":
+                web_sources = build_web_source_payloads(
+                    outcome.results,
+                    snippet_chars=settings.search_snippet_chars,
+                )
+                state.sources.extend(web_sources)
+                for payload in web_sources:
+                    yield "source", payload
+                extra_prompt = build_web_block(
+                    outcome.results,
+                    max_chars=settings.search_context_max_chars,
+                    intent=outcome.intent,
+                )
+            elif outcome.status == "empty":
+                extra_prompt = build_web_empty_block(outcome.message)
+            else:
+                extra_prompt = build_web_unavailable_block(outcome.message)
+
+            terminal = {
+                "tool": "web_search",
+                "status": {"ok": "done", "empty": "empty"}.get(
+                    outcome.status, "unavailable"
+                ),
+                "message": outcome.message,
+                "provider": outcome.provider,
+            }
+            state.tool_statuses.append(terminal)
+            yield "tool_status", terminal
+
+            # 搜索期间用户可能已经点了停止；此时不再调用模型。
+            if await request.is_disconnected():
+                state.status = STATUS_INTERRUPTED
+                state.finish_reason = "interrupted"
+                return
+
+            provider_messages = merge_web_context(
+                prepared.provider_messages, extra_prompt
+            )
+
+        async for event in self.provider.stream_chat(
+            provider_messages, self._options_factory()
+        ):
+            # 主动检查断开：前端点「停止生成」后，这里是最先能感知到的地方。
+            # 走这条路不抛异常，能干净地收尾。
+            if await request.is_disconnected():
+                state.status = STATUS_INTERRUPTED
+                state.finish_reason = "interrupted"
+                return
+
+            if event.type == "token" and event.text:
+                state.chunks.append(event.text)
+                yield "token", {"text": event.text}
+            elif event.type == "usage":
+                state.usage = event.usage
+            elif event.type == "done":
+                state.finish_reason = event.finish_reason or "stop"
 
     async def _finalize_safely(
         self,
         prepared: PreparedTurn,
-        content: str,
-        status: str,
-        usage: ChatUsage | None,
-        finish_reason: str | None,
-        *,
-        sources: list[dict[str, Any]] | None = None,
-        tool_statuses: list[dict[str, Any]] | None = None,
-        citation_report: dict[str, Any] | None = None,
+        state: TurnState,
     ) -> None:
         """回填助手消息。用独立 session，且不让写库失败影响流的收尾。"""
         metadata: dict = {}
-        if finish_reason:
-            metadata["finish_reason"] = finish_reason
-        if usage is not None:
-            metadata["usage"] = usage.as_dict()
+        if state.finish_reason:
+            metadata["finish_reason"] = state.finish_reason
+        if state.usage is not None:
+            metadata["usage"] = state.usage.as_dict()
         # 来源在失败/中断时也保留，刷新历史后仍能看到引用过哪些片段。
-        if sources is None:
-            sources = prepared.sources
-        if sources:
-            metadata["sources"] = list(sources)
-        # running 是瞬态状态，不落库；只保存 done/empty/unavailable。
-        if tool_statuses:
-            metadata["tool_statuses"] = list(tool_statuses)
-        if citation_report:
-            metadata["citation_report"] = citation_report
+        if state.sources:
+            metadata["sources"] = list(state.sources)
+        # running 是瞬态状态，不落库；只保存终态。
+        if state.tool_statuses:
+            metadata["tool_statuses"] = list(state.tool_statuses)
+        if state.citation_report:
+            metadata["citation_report"] = state.citation_report
+        if prepared.agent_mode == "auto":
+            metadata["agent"] = {
+                "steps": state.steps,
+                "tool_calls": state.tool_calls,
+                "limit_reached": state.limit_reached,
+            }
 
         async def write() -> None:
             async with self.session_factory() as session:
                 await MessageRepository(session).finalize(
                     prepared.assistant_message_id,
-                    content=content,
-                    status=status,
+                    content="".join(state.chunks),
+                    status=state.status,
                     model_provider=self.provider.name,
                     model_name=getattr(self.provider, "model", None),
                     metadata_json=metadata or None,

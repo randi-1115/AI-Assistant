@@ -38,6 +38,12 @@ if _test_database_url:
     os.environ["SEARCH_FALLBACK_PROVIDER"] = ""
     # 测试默认不调用额外 LLM 做查询规划。
     os.environ["SEARCH_LLM_PLANNING_ENABLED"] = "false"
+    # P2 工具/Agent 的确定性配置：不依赖开发者 .env。
+    os.environ["TOOLS_ENABLED"] = "calculator,document_search,web_search"
+    os.environ["AGENT_MAX_TOOL_CALLS"] = "3"
+    os.environ["AGENT_TOTAL_TIMEOUT_SECONDS"] = "90"
+    os.environ["TOOL_TIMEOUT_SECONDS"] = "15"
+    os.environ["SEARCH_TOTAL_TIMEOUT_SECONDS"] = "12"
     # 让后续 get_settings() 重新读取上面这些覆盖值。
     get_settings.cache_clear()
 

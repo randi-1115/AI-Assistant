@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-import type { SearchMode } from '../../types/chat'
+import type { AgentMode, SearchMode } from '../../types/chat'
 import { parseStatusLabel, type UploadedFile } from '../../types/file'
 import FileUploader from './FileUploader.vue'
 
@@ -12,10 +12,17 @@ const props = defineProps<{
   conversationId: number | null
   /** 后端是否配置了联网搜索；false 时开关置灰。 */
   webSearchAvailable?: boolean
+  /** 后端是否支持工具模式；false 时开关置灰。 */
+  agentModeAvailable?: boolean
 }>()
 
 const emit = defineEmits<{
-  send: [content: string, attachments: UploadedFile[], searchMode: SearchMode]
+  send: [
+    content: string,
+    attachments: UploadedFile[],
+    searchMode: SearchMode,
+    agentMode: AgentMode,
+  ]
   stop: []
 }>()
 
@@ -24,6 +31,7 @@ const textarea = ref<HTMLTextAreaElement | null>(null)
 const attachments = ref<UploadedFile[]>([])
 const uploadError = ref<string | null>(null)
 const webSearch = ref(false)
+const agentMode = ref(false)
 
 function addAttachment(file: UploadedFile): void {
   uploadError.value = null
@@ -45,11 +53,13 @@ function submit(): void {
   const pending = [...attachments.value]
   const searchMode: SearchMode =
     props.webSearchAvailable === false ? 'off' : webSearch.value ? 'auto' : 'off'
+  const nextAgentMode: AgentMode =
+    props.agentModeAvailable === false ? 'off' : agentMode.value ? 'auto' : 'off'
   text.value = ''
   attachments.value = []
   uploadError.value = null
-  // 联网搜索开关是用户偏好，发送后保留，不重置。
-  emit('send', content, pending, searchMode)
+  // 联网搜索/工具模式开关是用户偏好，发送后保留，不重置。
+  emit('send', content, pending, searchMode, nextAgentMode)
 }
 
 function handleKeydown(event: KeyboardEvent): void {
@@ -125,6 +135,22 @@ defineExpose({ focus })
             :disabled="disabled || streaming || webSearchAvailable === false"
           />
           <span>联网搜索</span>
+        </label>
+        <label
+          class="search-toggle"
+          :class="{ active: agentMode }"
+          :title="
+            agentModeAvailable === false
+              ? '当前模型/配置不支持工具模式'
+              : '工具模式：由模型决定是否调用计算、文档检索、联网搜索等工具'
+          "
+        >
+          <input
+            v-model="agentMode"
+            type="checkbox"
+            :disabled="disabled || streaming || agentModeAvailable === false"
+          />
+          <span>工具模式</span>
         </label>
         <FileUploader
           :disabled="disabled || streaming"

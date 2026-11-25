@@ -8,7 +8,7 @@ import MessageList from '../components/chat/MessageList.vue'
 import AppLayout from '../components/layout/AppLayout.vue'
 import { useChatStore } from '../stores/chat'
 import { useConversationsStore } from '../stores/conversations'
-import type { SearchMode } from '../types/chat'
+import type { AgentMode, SearchMode } from '../types/chat'
 import type { UploadedFile } from '../types/file'
 
 const conversations = useConversationsStore()
@@ -38,6 +38,7 @@ async function handleSend(
   content: string,
   attachments: UploadedFile[],
   searchMode: SearchMode,
+  agentMode: AgentMode,
 ): Promise<void> {
   let conversationId = currentId.value
   // 还没有会话时直接开聊：自动建一个再发。
@@ -46,7 +47,7 @@ async function handleSend(
     if (!created) return
     conversationId = created.id
   }
-  await chat.sendMessage(conversationId, content, attachments, searchMode)
+  await chat.sendMessage(conversationId, content, attachments, searchMode, agentMode)
 }
 
 async function handleRegenerate(): Promise<void> {
@@ -75,6 +76,7 @@ async function handleRegenerate(): Promise<void> {
       :streaming="streaming"
       :conversation-id="currentId"
       :web-search-available="capabilities?.web_search ?? true"
+      :agent-mode-available="capabilities?.agent_mode ?? false"
       @send="handleSend"
       @stop="chat.stop()"
     />

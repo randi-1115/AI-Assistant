@@ -56,6 +56,7 @@ async def stream_message(
         content=payload.content,
         attachment_ids=payload.attachment_ids,
         search_mode=payload.search_mode.value,
+        agent_mode=payload.agent_mode.value,
     )
 
     # 首轮对话结束后自动起标题。用 BackgroundTasks 而不是 asyncio.create_task：

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator, Sequence
 
 from app.ai.providers.base import (
@@ -27,8 +28,10 @@ from app.ai.providers.base import (
     ChatOptions,
     ChatResult,
     LLMProvider,
+    ROLE_TOOL,
     ROLE_USER,
     StreamEvent,
+    ToolCall,
 )
 from app.core.errors import (
     LLMAuthError,
@@ -43,6 +46,10 @@ TRIGGER_MID_STREAM = "__mock_error_after__"
 TRIGGER_TIMEOUT = "__mock_timeout__"
 TRIGGER_RATE_LIMIT = "__mock_rate_limit__"
 TRIGGER_AUTH = "__mock_auth__"
+
+# 工具调用标记：__mock_tool__<name> <json>，每行一个（允许出现在行内）。
+# 只在本次请求真的暴露了 tools 时才生效，避免标题生成等调用被误触发。
+_TOOL_MARKER = re.compile(r"__mock_tool__([a-z][a-z0-9_]*)(?:\s+(.*))?$")
 
 # 全局强制错误：MOCK_FORCE_ERROR=upstream|timeout|rate_limit|auth
 FORCE_ERROR_MAP = {
@@ -72,7 +79,9 @@ def _last_user_content(messages: Sequence[ChatMessage]) -> str:
 
 class MockProvider(LLMProvider):
     name = "mock"
-    _capabilities = frozenset({Capability.TEXT_CHAT, Capability.STREAMING})
+    _capabilities = frozenset(
+        {Capability.TEXT_CHAT, Capability.STREAMING, Capability.TOOL_CALLING}
+    )
 
     def __init__(
         self,
@@ -125,6 +134,46 @@ class MockProvider(LLMProvider):
             # 用户自定义 MOCK_DEFAULT_REPLY 时可能带了别的占位符，不要因此炸掉。
             return self.reply_template
 
+    @staticmethod
+    def _tool_markers(messages: Sequence[ChatMessage]) -> list[ToolCall]:
+        markers: list[ToolCall] = []
+        for line in _last_user_content(messages).splitlines():
+            match = _TOOL_MARKER.search(line)
+            if not match:
+                continue
+            arguments = (match.group(2) or "").strip() or "{}"
+            markers.append(ToolCall(id="", name=match.group(1), arguments=arguments))
+        return markers
+
+    @staticmethod
+    def _tool_messages_after_last_user(messages: Sequence[ChatMessage]) -> int:
+        last_user = -1
+        for index, message in enumerate(messages):
+            if message.role == ROLE_USER:
+                last_user = index
+        return sum(
+            1 for message in messages[last_user + 1 :] if message.role == ROLE_TOOL
+        )
+
+    def _pending_tool_call(
+        self, messages: Sequence[ChatMessage], options: ChatOptions | None
+    ) -> ToolCall | None:
+        """按"已回填的 tool 消息数"决定本次该发第几个标记，实现确定性多步。"""
+        if options is None or not options.tools:
+            return None
+        markers = self._tool_markers(messages)
+        if not markers:
+            return None
+        done = self._tool_messages_after_last_user(messages)
+        if done >= len(markers):
+            return None
+        marker = markers[done]
+        return ToolCall(
+            id=f"mock_call_{done}_{len(markers)}",
+            name=marker.name,
+            arguments=marker.arguments,
+        )
+
     def _chunks(self, text: str) -> list[str]:
         return [text[i : i + self.chunk_size] for i in range(0, len(text), self.chunk_size)]
 
@@ -140,6 +189,15 @@ class MockProvider(LLMProvider):
         error = self._error_for(messages)
         if error is not None:
             raise error
+        call = self._pending_tool_call(messages, options)
+        if call is not None:
+            return ChatResult(
+                text="",
+                model_name=self.model_name,
+                finish_reason="tool_calls",
+                usage=None,
+                tool_calls=(call,),
+            )
         return ChatResult(
             text=self._build_reply(messages),
             model_name=self.model_name,
@@ -154,6 +212,12 @@ class MockProvider(LLMProvider):
         error = self._error_for(messages)
         if error is not None:
             raise error
+
+        call = self._pending_tool_call(messages, options)
+        if call is not None:
+            yield StreamEvent.tool_call_event(call)
+            yield StreamEvent.done("tool_calls")
+            return
 
         mid_stream_error = self._mid_stream_error(messages)
         reply = self._build_reply(messages)

@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 ROLE_SYSTEM = "system"
 ROLE_USER = "user"
@@ -30,9 +30,26 @@ class Capability(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCall:
+    """模型请求的一次工具调用。
+
+    arguments 保留供应商返回的**原始 JSON 字符串**，由 agent 循环负责解析；
+    供应商不保证它一定是合法 JSON，解析失败要能回填给模型而不是抛异常。
+    """
+
+    id: str
+    name: str
+    arguments: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: str
     content: str
+    # assistant 消息可携带模型请求的工具调用。
+    tool_calls: tuple[ToolCall, ...] = ()
+    # role=tool 的消息必须带上它回应的 tool_call.id。
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +57,9 @@ class ChatOptions:
     temperature: float | None = None
     max_output_tokens: int | None = None
     timeout_seconds: float | None = None
+    # OpenAI function calling 定义；空元组表示本次请求不暴露工具。
+    tools: tuple[dict[str, Any], ...] = ()
+    tool_choice: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,21 +79,24 @@ class ChatResult:
     model_name: str | None = None
     finish_reason: str | None = None
     usage: ChatUsage | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class StreamEvent:
-    """流式事件。type 只有三种：
+    """流式事件。type 只有四种：
 
-    token —— 一段新文本
-    usage —— 用量信息（可能不出现，取决于供应商）
-    done  —— 流结束，带 finish_reason
+    token     —— 一段新文本
+    usage     —— 用量信息（可能不出现，取决于供应商）
+    tool_call —— 一次完整的工具调用（由 adapter 累积增量后发出）
+    done      —— 流结束，带 finish_reason
     """
 
-    type: Literal["token", "usage", "done"]
+    type: Literal["token", "usage", "tool_call", "done"]
     text: str | None = None
     usage: ChatUsage | None = None
     finish_reason: str | None = None
+    tool_call: ToolCall | None = None
 
     @classmethod
     def token(cls, text: str) -> "StreamEvent":
@@ -82,6 +105,10 @@ class StreamEvent:
     @classmethod
     def usage_event(cls, usage: ChatUsage) -> "StreamEvent":
         return cls(type="usage", usage=usage)
+
+    @classmethod
+    def tool_call_event(cls, call: ToolCall) -> "StreamEvent":
+        return cls(type="tool_call", tool_call=call)
 
     @classmethod
     def done(cls, finish_reason: str = "stop") -> "StreamEvent":
